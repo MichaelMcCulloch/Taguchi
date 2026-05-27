@@ -82,14 +82,25 @@ pub fn try_construct(levels: &[usize]) -> Result<Option<Selected>> {
 pub fn bush_at(gf: &Gf, k: usize) -> Vec<Vec<u8>> {
     #[cfg(target_arch = "x86_64")]
     {
-        if gf.p == 2 && gf.q <= 16 {
-            if std::is_x86_feature_detected!("avx2") {
-                let cols = enumerate_directions(gf.q, k);
-                return unsafe { bush_at_simd_gf2pow_avx2(gf, k, &cols) };
+        if gf.q <= 16 {
+            let has_avx2 = std::is_x86_feature_detected!("avx2");
+            let has_ssse3 = std::is_x86_feature_detected!("ssse3");
+            // GF(2^k): add is XOR → fastest path.
+            if gf.p == 2 {
+                if has_avx2 {
+                    let cols = enumerate_directions(gf.q, k);
+                    return unsafe { bush_at_simd_gf2pow_avx2(gf, k, &cols) };
+                }
+                if has_ssse3 {
+                    let cols = enumerate_directions(gf.q, k);
+                    return unsafe { bush_at_simd_gf2pow(gf, k, &cols) };
+                }
             }
-            if std::is_x86_feature_detected!("ssse3") {
+            // Prime q with p ≠ 2 (q ∈ {3, 5, 7, 11, 13}): modular SIMD add.
+            // gf.k == 1 means q is a true prime (not an extension field).
+            if gf.k == 1 && has_avx2 {
                 let cols = enumerate_directions(gf.q, k);
-                return unsafe { bush_at_simd_gf2pow(gf, k, &cols) };
+                return unsafe { bush_at_simd_prime_avx2(gf, k, &cols) };
             }
         }
     }
@@ -259,6 +270,97 @@ unsafe fn bush_at_simd_gf2pow_avx2(gf: &Gf, k: usize, directions: &[Vec<u8>]) ->
                     let mul_row_256 = _mm256_broadcastsi128_si256(mul_row_128);
                     let mul_result = _mm256_shuffle_epi8(mul_row_256, a_vecs[i]);
                     acc = _mm256_xor_si256(acc, mul_result);
+                }
+                let out_ptr = flat.as_mut_ptr().add(col_idx * n_rows + r_block);
+                if batch == 32 {
+                    _mm256_storeu_si256(out_ptr as *mut __m256i, acc);
+                } else {
+                    let mut arr = [0u8; 32];
+                    _mm256_storeu_si256(arr.as_mut_ptr() as *mut __m256i, acc);
+                    for r in 0..batch {
+                        *out_ptr.add(r) = arr[r];
+                    }
+                }
+            }
+        }
+    }
+
+    let mut rows = vec![vec![0u8; n_cols]; n_rows];
+    for c in 0..n_cols {
+        let base = c * n_rows;
+        for r in 0..n_rows {
+            rows[r][c] = flat[base + r];
+        }
+    }
+    rows
+}
+
+/// AVX2 variant for prime q ≤ 16 with p ≠ 2 (q ∈ {3, 5, 7, 11, 13}).
+///
+/// Same 32-row tile structure as the GF(2^k) version, but the GF add is
+/// modular `(a + b) mod q` instead of XOR. We use the branch-free modular
+/// trick: `min(sum, sum - q)` where both are unsigned-byte values. When
+/// `sum < q` the subtraction wraps to a large value (`sum + 256 - q`) and
+/// `_mm256_min_epu8` picks `sum`; otherwise it picks `sum - q`. Correct as
+/// long as `0 ≤ a, b < q`, so `sum < 2q ≤ 26 < 256`.
+///
+/// Does NOT apply to extension fields GF(p^k) with p ≠ 2 (GF(9), GF(25),
+/// GF(27), GF(49)) — their addition is per-digit mod p, not (a+b) mod q.
+/// Those still take the scalar fallback.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn bush_at_simd_prime_avx2(gf: &Gf, k: usize, directions: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    use std::arch::x86_64::*;
+
+    let q = gf.q;
+    let n_rows = (q as u64).pow(k as u32) as usize;
+    let n_cols = directions.len();
+
+    let mut mul_rows: Vec<[u8; 16]> = Vec::with_capacity(q);
+    for a in 0..q {
+        let mut row = [0u8; 16];
+        for c in 0..q {
+            row[c] = gf.mul(a as u8, c as u8);
+        }
+        mul_rows.push(row);
+    }
+
+    let q_vec = _mm256_set1_epi8(q as i8);
+    let mut flat = vec![0u8; n_rows * n_cols];
+    let mut a_buf: Vec<[u8; 32]> = vec![[0u8; 32]; k];
+
+    unsafe {
+        for r_block in (0..n_rows).step_by(32) {
+            let batch = (n_rows - r_block).min(32);
+            for r in 0..batch {
+                let mut idx = r_block + r;
+                for i in 0..k {
+                    a_buf[i][r] = (idx % q) as u8;
+                    idx /= q;
+                }
+            }
+            for r in batch..32 {
+                for i in 0..k {
+                    a_buf[i][r] = 0;
+                }
+            }
+
+            let a_vecs: Vec<__m256i> = a_buf
+                .iter()
+                .map(|arr| _mm256_loadu_si256(arr.as_ptr() as *const __m256i))
+                .collect();
+
+            for (col_idx, c) in directions.iter().enumerate() {
+                let mut acc = _mm256_setzero_si256();
+                for i in 0..k {
+                    let c_i = c[i] as usize;
+                    let mul_row_128 =
+                        _mm_loadu_si128(mul_rows[c_i].as_ptr() as *const __m128i);
+                    let mul_row_256 = _mm256_broadcastsi128_si256(mul_row_128);
+                    let mul_result = _mm256_shuffle_epi8(mul_row_256, a_vecs[i]);
+                    let sum = _mm256_add_epi8(acc, mul_result);
+                    let sum_minus_q = _mm256_sub_epi8(sum, q_vec);
+                    acc = _mm256_min_epu8(sum, sum_minus_q);
                 }
                 let out_ptr = flat.as_mut_ptr().add(col_idx * n_rows + r_block);
                 if batch == 32 {
