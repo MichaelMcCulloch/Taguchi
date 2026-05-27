@@ -36,6 +36,9 @@ fn bench_bush_raw(c: &mut Criterion) {
         // Huge — for headroom measurement only
         (2, 13),  // L8192
         (3, 8),   // L6561
+        // Beyond — only feasible with SIMD on GF(2^k)
+        (2, 14),  // L16384, 16383 cols, 268M cells
+        (2, 15),  // L32768, 32767 cols, 1B cells
     ];
     for &(q, k) in cases {
         let n = (q as u64).pow(k as u32) as usize;
