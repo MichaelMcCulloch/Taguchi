@@ -1,0 +1,48 @@
+From: Warren Kuhfeld <Warren.Kuhfeld@sas.com>
+Subject: 3 4 2^13 in 24 runs
+Date: Fri, 19 Apr 2002 10:00:42 -0400
+
+Neil, Here is design 3 4 2^13 in 24 runs.  
+It was a bit of a struggle to generate.  
+My usual method of looking for 3 two-level factors to replace with
+a 4 (in 3 2^16) did not work since there is not a 2 that is the
+perfect interaction of two other 2's.
+While I still have a long ways to go, my new software can generate 
+most of the designs in Table 12.7 of Hedayat, Sloane, and Stufken,
+and a lot of other designs too.
+Warren
+
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+0 0 0 1 1 0 0 1 1 1 0 1 0 1 1
+0 2 0 1 0 1 0 0 1 1 1 0 1 0 0
+0 2 0 0 1 0 1 0 0 1 1 1 1 1 1
+1 1 0 1 1 1 0 0 0 0 1 1 0 0 1
+1 2 0 1 0 1 1 1 0 0 0 1 0 1 0
+1 3 0 1 1 0 1 0 1 0 0 0 1 0 0
+1 3 0 0 1 1 0 1 0 1 0 0 1 1 1
+2 0 0 0 1 1 1 1 1 0 1 0 0 0 1
+2 1 0 0 0 1 1 0 1 1 0 1 0 1 0
+2 1 0 1 0 0 1 1 0 1 1 0 1 0 1
+2 3 0 0 0 0 0 1 1 0 1 1 1 1 0
+0 3 1 1 1 1 1 1 1 1 1 1 0 0 0
+0 3 1 0 0 1 1 0 0 0 1 0 0 1 1
+0 1 1 0 1 0 1 1 0 0 0 1 1 0 0
+0 1 1 1 0 1 0 1 1 0 0 0 1 1 1
+1 2 1 0 0 0 1 1 1 1 0 0 0 0 1
+1 1 1 0 1 0 0 0 1 1 1 0 0 1 0
+1 0 1 0 0 1 0 1 0 1 1 1 1 0 0
+1 0 1 1 0 0 1 0 1 0 1 1 1 1 1
+2 3 1 1 0 0 0 0 0 1 0 1 0 0 1
+2 2 1 1 1 0 0 1 0 0 1 0 0 1 0
+2 2 1 0 1 1 0 0 1 0 0 1 1 0 1
+2 0 1 1 1 1 1 0 0 1 0 0 1 1 0
+
+Warren F. Kuhfeld        SAS Institute Inc.  (919) 677-8000 x17922
+Multivariate Models R&D  Cary, NC 27513-2414 (919) 677-4444  (Fax)
+R5116 SAS Campus Dr.     www.sas.com     SAS ... The Power to Know
+Opinions expressed here are mine and not necessarily those of SAS.
+
+Marketing Research, Discrete Choice, Conjoint, Experimental Design,
+and Graphics Reports TS-650A through TS-650I can be obtained from:
+http://www.sas.com/service/techsup/tnote/tnote_stat.html
+

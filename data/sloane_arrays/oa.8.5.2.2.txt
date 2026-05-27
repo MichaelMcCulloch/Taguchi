@@ -1,0 +1,9 @@
+00000
+10011
+01010
+00101
+11001
+10110
+01111
+11100
+Shortened Hamming code of length 5.

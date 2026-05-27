@@ -1,0 +1,9 @@
+0000
+0011
+0101
+0110
+1001
+1010
+1100
+1111
+Zero-sum array (Table 1.12 of Chap. 1, Section 2.1 of Chap. 2).

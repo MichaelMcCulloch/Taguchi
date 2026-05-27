@@ -1,0 +1,31 @@
+    0    0    0    0    0    0    0    0    0
+    0    1    1    1    1    0    1    1    0
+    1    0    1    0    0    1    1    1    0
+    1    1    0    1    1    1    0    0    0
+    0    0    0    1    1    0    1    1    1
+    0    1    0    0    0    1    1    0    1
+    1    0    1    0    1    0    0    0    1
+    1    1    1    1    0    1    0    1    1
+    0    0    1    0    1    1    1    1    2
+    0    1    1    0    0    0    0    0    2
+    1    0    0    1    0    1    0    1    2
+    1    1    0    1    1    0    1    0    2
+    0    0    0    1    0    1    1    0    3
+    0    1    1    1    0    0    0    1    3
+    1    0    0    0    1    0    0    1    3
+    1    1    1    0    1    1    1    0    3
+    0    0    1    1    1    1    0    0    4
+    0    1    0    0    1    1    0    1    4
+    1    0    1    1    0    0    1    0    4
+    1    1    0    0    0    0    1    1    4
+
+
+
+
+An OA(20, 2^8 5^1) 
+Professor J. Stufken
+Department of Statistics      email: jstufken@iastate.edu
+Iowa State University         Phone: (515) 294-7806
+Ames, Iowa 50011              Fax:   (515) 294-4040
+URL: http://www.public.iastate.edu/~jstufken/
+
