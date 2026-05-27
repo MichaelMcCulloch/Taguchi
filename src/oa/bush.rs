@@ -75,7 +75,28 @@ pub fn try_construct(levels: &[usize]) -> Result<Option<Selected>> {
 
 /// Bush construction at a given GF and depth k. Returns full
 /// q^k × (q^k-1)/(q-1) array with cell values as `u8`.
+///
+/// Dispatches to an x86_64 SSSE3 path for GF(2^k) with q ≤ 16 (uses
+/// `pshufb` for 16-way GF mult per cycle); falls back to scalar for
+/// everything else.
 pub fn bush_at(gf: &Gf, k: usize) -> Vec<Vec<u8>> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if gf.p == 2 && gf.q <= 16 {
+            if std::is_x86_feature_detected!("avx2") {
+                let cols = enumerate_directions(gf.q, k);
+                return unsafe { bush_at_simd_gf2pow_avx2(gf, k, &cols) };
+            }
+            if std::is_x86_feature_detected!("ssse3") {
+                let cols = enumerate_directions(gf.q, k);
+                return unsafe { bush_at_simd_gf2pow(gf, k, &cols) };
+            }
+        }
+    }
+    bush_at_scalar(gf, k)
+}
+
+fn bush_at_scalar(gf: &Gf, k: usize) -> Vec<Vec<u8>> {
     let q = gf.q;
     let cols = enumerate_directions(q, k);
     let n_rows = (q as u64).pow(k as u32) as usize;
@@ -93,6 +114,174 @@ pub fn bush_at(gf: &Gf, k: usize) -> Vec<Vec<u8>> {
         oa.push(row);
     }
     oa
+}
+
+/// SSSE3 SIMD path for GF(2^k) with q ≤ 16. Processes 16 rows in parallel
+/// per (column, digit) iteration using `_mm_shuffle_epi8` for the GF
+/// multiplication table lookup and `_mm_xor_si128` for the GF add.
+///
+/// Computes column-major into a flat buffer (so each 16-row tile stores as
+/// one `_mm_storeu_si128`), then transposes to the row-major `Vec<Vec<u8>>`
+/// the caller expects. The transpose is memory-bandwidth bound and small
+/// compared to the construction itself.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn bush_at_simd_gf2pow(gf: &Gf, k: usize, directions: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    use std::arch::x86_64::*;
+
+    let q = gf.q;
+    let n_rows = (q as u64).pow(k as u32) as usize;
+    let n_cols = directions.len();
+
+    // mul_rows[a] = 16 bytes where index i gives gf.mul(a, i). Padded with
+    // zero for i ≥ q (those slots are never addressed since a-values < q).
+    let mut mul_rows: Vec<[u8; 16]> = Vec::with_capacity(q);
+    for a in 0..q {
+        let mut row = [0u8; 16];
+        for c in 0..q {
+            row[c] = gf.mul(a as u8, c as u8);
+        }
+        mul_rows.push(row);
+    }
+
+    // Column-major flat buffer: cell(r, c) at offset c*n_rows + r.
+    let mut flat = vec![0u8; n_rows * n_cols];
+
+    let mut a_buf: Vec<[u8; 16]> = vec![[0u8; 16]; k];
+
+    unsafe {
+        for r_block in (0..n_rows).step_by(16) {
+            let batch = (n_rows - r_block).min(16);
+            for r in 0..batch {
+                let mut idx = r_block + r;
+                for i in 0..k {
+                    a_buf[i][r] = (idx % q) as u8;
+                    idx /= q;
+                }
+            }
+            for r in batch..16 {
+                for i in 0..k {
+                    a_buf[i][r] = 0;
+                }
+            }
+
+            let a_vecs: Vec<__m128i> = a_buf
+                .iter()
+                .map(|arr| _mm_loadu_si128(arr.as_ptr() as *const __m128i))
+                .collect();
+
+            for (col_idx, c) in directions.iter().enumerate() {
+                let mut acc = _mm_setzero_si128();
+                for i in 0..k {
+                    let c_i = c[i] as usize;
+                    let mul_row =
+                        _mm_loadu_si128(mul_rows[c_i].as_ptr() as *const __m128i);
+                    let mul_result = _mm_shuffle_epi8(mul_row, a_vecs[i]);
+                    acc = _mm_xor_si128(acc, mul_result);
+                }
+                let out_ptr = flat.as_mut_ptr().add(col_idx * n_rows + r_block);
+                if batch == 16 {
+                    _mm_storeu_si128(out_ptr as *mut __m128i, acc);
+                } else {
+                    let mut arr = [0u8; 16];
+                    _mm_storeu_si128(arr.as_mut_ptr() as *mut __m128i, acc);
+                    for r in 0..batch {
+                        *out_ptr.add(r) = arr[r];
+                    }
+                }
+            }
+        }
+    }
+
+    // Transpose column-major flat → row-major Vec<Vec<u8>>.
+    let mut rows = vec![vec![0u8; n_cols]; n_rows];
+    for c in 0..n_cols {
+        let base = c * n_rows;
+        for r in 0..n_rows {
+            rows[r][c] = flat[base + r];
+        }
+    }
+    rows
+}
+
+/// AVX2 variant — same algorithm, 32-row batches via `_mm256_shuffle_epi8`.
+/// `_mm256_shuffle_epi8` is lane-wise (two parallel 16-byte shuffles within
+/// each 128-bit half), so we broadcast the 16-byte mul row to both lanes
+/// with `_mm256_broadcastsi128_si256` and a single shuffle does 32 lookups.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn bush_at_simd_gf2pow_avx2(gf: &Gf, k: usize, directions: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    use std::arch::x86_64::*;
+
+    let q = gf.q;
+    let n_rows = (q as u64).pow(k as u32) as usize;
+    let n_cols = directions.len();
+
+    let mut mul_rows: Vec<[u8; 16]> = Vec::with_capacity(q);
+    for a in 0..q {
+        let mut row = [0u8; 16];
+        for c in 0..q {
+            row[c] = gf.mul(a as u8, c as u8);
+        }
+        mul_rows.push(row);
+    }
+
+    let mut flat = vec![0u8; n_rows * n_cols];
+    let mut a_buf: Vec<[u8; 32]> = vec![[0u8; 32]; k];
+
+    unsafe {
+        for r_block in (0..n_rows).step_by(32) {
+            let batch = (n_rows - r_block).min(32);
+            for r in 0..batch {
+                let mut idx = r_block + r;
+                for i in 0..k {
+                    a_buf[i][r] = (idx % q) as u8;
+                    idx /= q;
+                }
+            }
+            for r in batch..32 {
+                for i in 0..k {
+                    a_buf[i][r] = 0;
+                }
+            }
+
+            let a_vecs: Vec<__m256i> = a_buf
+                .iter()
+                .map(|arr| _mm256_loadu_si256(arr.as_ptr() as *const __m256i))
+                .collect();
+
+            for (col_idx, c) in directions.iter().enumerate() {
+                let mut acc = _mm256_setzero_si256();
+                for i in 0..k {
+                    let c_i = c[i] as usize;
+                    let mul_row_128 =
+                        _mm_loadu_si128(mul_rows[c_i].as_ptr() as *const __m128i);
+                    let mul_row_256 = _mm256_broadcastsi128_si256(mul_row_128);
+                    let mul_result = _mm256_shuffle_epi8(mul_row_256, a_vecs[i]);
+                    acc = _mm256_xor_si256(acc, mul_result);
+                }
+                let out_ptr = flat.as_mut_ptr().add(col_idx * n_rows + r_block);
+                if batch == 32 {
+                    _mm256_storeu_si256(out_ptr as *mut __m256i, acc);
+                } else {
+                    let mut arr = [0u8; 32];
+                    _mm256_storeu_si256(arr.as_mut_ptr() as *mut __m256i, acc);
+                    for r in 0..batch {
+                        *out_ptr.add(r) = arr[r];
+                    }
+                }
+            }
+        }
+    }
+
+    let mut rows = vec![vec![0u8; n_cols]; n_rows];
+    for c in 0..n_cols {
+        let base = c * n_rows;
+        for r in 0..n_rows {
+            rows[r][c] = flat[base + r];
+        }
+    }
+    rows
 }
 
 fn enumerate_directions(q: usize, k: usize) -> Vec<Vec<u8>> {
