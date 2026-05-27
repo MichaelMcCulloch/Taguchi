@@ -29,7 +29,7 @@ pub fn try_construct(levels: &[usize]) -> Result<Option<Selected>> {
     }
 
     // Build a Bush block for each level group.
-    let mut blocks: Vec<(usize, Vec<Vec<usize>>, Vec<usize>)> = Vec::new(); // (q, block_oa, factor_positions)
+    let mut blocks: Vec<(usize, Vec<Vec<u8>>, Vec<usize>)> = Vec::new(); // (q, block_oa, factor_positions)
     for (&q, positions) in by_level.iter() {
         let k_need = positions.len();
         let q_eff = bush::next_prime_power_at_least(q);
@@ -47,7 +47,7 @@ pub fn try_construct(levels: &[usize]) -> Result<Option<Selected>> {
             }
         }
         let full = bush::bush_at(&gf, k);
-        let block: Vec<Vec<usize>> = full
+        let block: Vec<Vec<u8>> = full
             .into_iter()
             .map(|row| row.into_iter().take(k_need).collect())
             .collect();
@@ -58,7 +58,7 @@ pub fn try_construct(levels: &[usize]) -> Result<Option<Selected>> {
     let block_sizes: Vec<usize> = blocks.iter().map(|(_, b, _)| b.len()).collect();
     let total_rows: usize = block_sizes.iter().product();
     let total_cols = levels.len();
-    let mut array = vec![vec![0usize; total_cols]; total_rows];
+    let mut array = vec![vec![0u8; total_cols]; total_rows];
 
     for row_idx in 0..total_rows {
         // Decompose row_idx into block indices.

@@ -13,8 +13,9 @@ pub struct Gf {
     pub k: usize,
     pub q: usize,
     // Multiplication and addition tables (q × q). Indexed [a * q + b].
-    add: Vec<usize>,
-    mul: Vec<usize>,
+    // Stored as u8 since q ≤ 49 for all supported fields (cache-friendly).
+    add: Vec<u8>,
+    mul: Vec<u8>,
 }
 
 impl Gf {
@@ -29,12 +30,12 @@ impl Gf {
 
     fn prime(p: usize) -> Self {
         let q = p;
-        let mut add = vec![0; q * q];
-        let mut mul = vec![0; q * q];
+        let mut add = vec![0u8; q * q];
+        let mut mul = vec![0u8; q * q];
         for a in 0..q {
             for b in 0..q {
-                add[a * q + b] = (a + b) % p;
-                mul[a * q + b] = (a * b) % p;
+                add[a * q + b] = ((a + b) % p) as u8;
+                mul[a * q + b] = ((a * b) % p) as u8;
             }
         }
         Gf { p, k: 1, q, add, mul }
@@ -44,8 +45,8 @@ impl Gf {
     /// monic irreducible polynomial (constant term first, leading 1 last).
     fn extension(p: usize, k: usize, irr: &[usize]) -> Self {
         let q = (p as u64).pow(k as u32) as usize;
-        let mut add = vec![0; q * q];
-        let mut mul = vec![0; q * q];
+        let mut add = vec![0u8; q * q];
+        let mut mul = vec![0u8; q * q];
 
         for a in 0..q {
             let pa = to_poly(a, p, k);
@@ -54,7 +55,7 @@ impl Gf {
 
                 // Addition: coefficient-wise mod p.
                 let sum_poly: Vec<usize> = (0..k).map(|i| (pa[i] + pb[i]) % p).collect();
-                add[a * q + b] = from_poly(&sum_poly, p);
+                add[a * q + b] = from_poly(&sum_poly, p) as u8;
 
                 // Multiplication: polynomial mult, reduce mod irr.
                 let mut prod = vec![0usize; 2 * k - 1];
@@ -78,19 +79,19 @@ impl Gf {
                     prod[deg] = 0;
                 }
                 let reduced: Vec<usize> = prod[..k].to_vec();
-                mul[a * q + b] = from_poly(&reduced, p);
+                mul[a * q + b] = from_poly(&reduced, p) as u8;
             }
         }
         Gf { p, k, q, add, mul }
     }
 
     #[inline]
-    pub fn add(&self, a: usize, b: usize) -> usize {
-        self.add[a * self.q + b]
+    pub fn add(&self, a: u8, b: u8) -> u8 {
+        self.add[a as usize * self.q + b as usize]
     }
     #[inline]
-    pub fn mul(&self, a: usize, b: usize) -> usize {
-        self.mul[a * self.q + b]
+    pub fn mul(&self, a: u8, b: u8) -> u8 {
+        self.mul[a as usize * self.q + b as usize]
     }
 }
 
@@ -162,22 +163,22 @@ mod tests {
     fn check_field(gf: &Gf) {
         let q = gf.q;
         // 0 is additive identity, 1 is multiplicative identity.
-        for a in 0..q {
+        for a in 0..q as u8 {
             assert_eq!(gf.add(a, 0), a, "a+0 != a at a={}", a);
             assert_eq!(gf.mul(a, 1), a, "a*1 != a at a={}", a);
             assert_eq!(gf.mul(a, 0), 0, "a*0 != 0 at a={}", a);
         }
         // Commutativity.
-        for a in 0..q {
-            for b in 0..q {
+        for a in 0..q as u8 {
+            for b in 0..q as u8 {
                 assert_eq!(gf.add(a, b), gf.add(b, a));
                 assert_eq!(gf.mul(a, b), gf.mul(b, a));
             }
         }
         // Every nonzero has a multiplicative inverse.
-        for a in 1..q {
+        for a in 1..q as u8 {
             let mut found = false;
-            for b in 1..q {
+            for b in 1..q as u8 {
                 if gf.mul(a, b) == 1 {
                     found = true;
                     break;
@@ -186,9 +187,9 @@ mod tests {
             assert!(found, "no inverse for {} in GF({})", a, q);
         }
         // Distributivity (spot check).
-        for a in 0..q {
-            for b in 0..q {
-                for c in 0..q {
+        for a in 0..q as u8 {
+            for b in 0..q as u8 {
+                for c in 0..q as u8 {
                     let left = gf.mul(a, gf.add(b, c));
                     let right = gf.add(gf.mul(a, b), gf.mul(a, c));
                     assert_eq!(left, right);

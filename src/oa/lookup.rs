@@ -20,7 +20,7 @@ struct CatalogEntry {
     n_runs: usize,
     /// Level count per column (length = total k).
     columns: Vec<usize>,
-    array: Vec<Vec<usize>>,
+    array: Vec<Vec<u8>>,
 }
 
 fn index() -> &'static [CatalogEntry] {
@@ -109,36 +109,30 @@ fn parse_filename(name: &str) -> Option<FilenameMeta> {
     }
 }
 
-fn parse_body(body: &str, n_runs: usize, columns: &[usize]) -> Option<Vec<Vec<usize>>> {
+fn parse_body(body: &str, n_runs: usize, columns: &[usize]) -> Option<Vec<Vec<u8>>> {
     let max_level = *columns.iter().max().unwrap_or(&2);
     let packed = max_level <= 10;
-    let mut rows: Vec<Vec<usize>> = Vec::with_capacity(n_runs);
+    let mut rows: Vec<Vec<u8>> = Vec::with_capacity(n_runs);
     for line in body.lines() {
         let s = line.trim();
         if s.is_empty() {
             continue;
         }
-        let row = if packed {
+        let row: Vec<u8> = if packed {
             let chars: Vec<char> = s.chars().filter(|c| !c.is_whitespace()).collect();
             if chars.len() != columns.len() {
-                // Could be a comment line or differently-formatted row.
-                if chars.iter().all(|c| c.is_ascii_digit()) && chars.len() == columns.len() {
-                    chars.iter().map(|c| (*c as u8 - b'0') as usize).collect()
-                } else {
-                    // Try whitespace-split anyway.
-                    let parts: Vec<&str> = s.split_whitespace().collect();
-                    if parts.len() != columns.len() {
-                        continue;
-                    }
-                    let parsed: Option<Vec<usize>> =
-                        parts.iter().map(|p| p.parse::<usize>().ok()).collect();
-                    match parsed {
-                        Some(v) => v,
-                        None => continue,
-                    }
+                let parts: Vec<&str> = s.split_whitespace().collect();
+                if parts.len() != columns.len() {
+                    continue;
+                }
+                let parsed: Option<Vec<u8>> =
+                    parts.iter().map(|p| p.parse::<u8>().ok()).collect();
+                match parsed {
+                    Some(v) => v,
+                    None => continue,
                 }
             } else if chars.iter().all(|c| c.is_ascii_digit()) {
-                chars.iter().map(|c| (*c as u8 - b'0') as usize).collect()
+                chars.iter().map(|c| (*c as u8) - b'0').collect()
             } else {
                 continue;
             }
@@ -147,15 +141,15 @@ fn parse_body(body: &str, n_runs: usize, columns: &[usize]) -> Option<Vec<Vec<us
             if parts.len() != columns.len() {
                 continue;
             }
-            let parsed: Option<Vec<usize>> =
-                parts.iter().map(|p| p.parse::<usize>().ok()).collect();
+            let parsed: Option<Vec<u8>> =
+                parts.iter().map(|p| p.parse::<u8>().ok()).collect();
             match parsed {
                 Some(v) => v,
                 None => continue,
             }
         };
         // Validate against column level bounds.
-        if row.iter().zip(columns).any(|(v, q)| v >= q) {
+        if row.iter().zip(columns).any(|(v, q)| (*v as usize) >= *q) {
             return None;
         }
         rows.push(row);
@@ -202,7 +196,7 @@ pub fn find(user_levels: &[usize]) -> Option<Selected> {
             chosen.push(pool.remove(0));
         }
         // Extract those columns from the entry's array.
-        let array: Vec<Vec<usize>> = entry
+        let array: Vec<Vec<u8>> = entry
             .array
             .iter()
             .map(|row| chosen.iter().map(|&c| row[c]).collect())

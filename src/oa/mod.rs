@@ -32,7 +32,10 @@ pub struct ArrayInfo {
 #[derive(Debug, Clone)]
 pub struct Selected {
     pub info: ArrayInfo,
-    pub array: Vec<Vec<usize>>,
+    /// OA cells in 0..column_levels[col]. Stored as u8 — every level count
+    /// we ever produce fits comfortably (max q is 49 in the GF tables; max
+    /// catalog column level is well under 256).
+    pub array: Vec<Vec<u8>>,
     pub column_levels: Vec<usize>,
 }
 
@@ -92,14 +95,14 @@ pub fn build_with_methods(factors: &[Factor], methods: &[Method]) -> Result<Sele
 /// Map an OA cell value (in 0..column_levels[col]) to the corresponding
 /// FactorValue. When column_levels[col] > factor.level_count() the overflow
 /// folds via modulo (distributes overhang across all factor levels).
-pub fn resolve_cell(factor: &Factor, oa_value: usize) -> FactorValue {
+pub fn resolve_cell(factor: &Factor, oa_value: u8) -> FactorValue {
     let l = factor.values.len();
-    factor.values[oa_value % l].clone()
+    factor.values[oa_value as usize % l].clone()
 }
 
 /// Strength-2 check: every pair of columns shows every (a, b) combination
 /// exactly N / (q_a * q_b) times.
-pub fn verify_strength2(array: &[Vec<usize>], column_levels: &[usize]) -> Result<()> {
+pub fn verify_strength2(array: &[Vec<u8>], column_levels: &[usize]) -> Result<()> {
     let n = array.len();
     let cols = column_levels.len();
     for i in 0..cols {
@@ -119,13 +122,15 @@ pub fn verify_strength2(array: &[Vec<usize>], column_levels: &[usize]) -> Result
             let expected = expected as usize;
             let mut counts = vec![0usize; qi * qj];
             for row in array {
-                if row[i] >= qi {
-                    bail!("col {} value {} ≥ qi={}", i, row[i], qi);
+                let vi = row[i] as usize;
+                let vj = row[j] as usize;
+                if vi >= qi {
+                    bail!("col {} value {} ≥ qi={}", i, vi, qi);
                 }
-                if row[j] >= qj {
-                    bail!("col {} value {} ≥ qj={}", j, row[j], qj);
+                if vj >= qj {
+                    bail!("col {} value {} ≥ qj={}", j, vj, qj);
                 }
-                counts[row[i] * qj + row[j]] += 1;
+                counts[vi * qj + vj] += 1;
             }
             for (k, c) in counts.iter().enumerate() {
                 if *c != expected {

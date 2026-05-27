@@ -1,0 +1,5 @@
+[build]
+# Use the host CPU's full instruction set (AVX2/BMI/SSE4 on this machine).
+# Drops portability of the resulting binary but matters for OA construction —
+# the inner GF mult-add loop benefits significantly from auto-vectorization.
+rustflags = ["-C", "target-cpu=native"]

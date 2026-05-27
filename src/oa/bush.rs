@@ -46,7 +46,7 @@ pub fn try_construct(levels: &[usize]) -> Result<Option<Selected>> {
     let gf = Gf::new(q)?;
     let array = bush_at(&gf, k);
     // Truncate to needed columns.
-    let array: Vec<Vec<usize>> = array
+    let array: Vec<Vec<u8>> = array
         .into_iter()
         .map(|row| row.into_iter().take(n_factors).collect())
         .collect();
@@ -74,8 +74,8 @@ pub fn try_construct(levels: &[usize]) -> Result<Option<Selected>> {
 }
 
 /// Bush construction at a given GF and depth k. Returns full
-/// q^k × (q^k-1)/(q-1) array.
-pub fn bush_at(gf: &Gf, k: usize) -> Vec<Vec<usize>> {
+/// q^k × (q^k-1)/(q-1) array with cell values as `u8`.
+pub fn bush_at(gf: &Gf, k: usize) -> Vec<Vec<u8>> {
     let q = gf.q;
     let cols = enumerate_directions(q, k);
     let n_rows = (q as u64).pow(k as u32) as usize;
@@ -84,7 +84,7 @@ pub fn bush_at(gf: &Gf, k: usize) -> Vec<Vec<usize>> {
         let a = idx_to_tuple(row_idx, q, k);
         let mut row = Vec::with_capacity(cols.len());
         for c in &cols {
-            let mut acc = 0usize;
+            let mut acc = 0u8;
             for i in 0..k {
                 acc = gf.add(acc, gf.mul(c[i], a[i]));
             }
@@ -95,17 +95,17 @@ pub fn bush_at(gf: &Gf, k: usize) -> Vec<Vec<usize>> {
     oa
 }
 
-fn enumerate_directions(q: usize, k: usize) -> Vec<Vec<usize>> {
+fn enumerate_directions(q: usize, k: usize) -> Vec<Vec<u8>> {
     let mut cols = Vec::new();
     for lead in 0..k {
         let n_trailing = k - lead - 1;
         let n_combos = (q as u64).pow(n_trailing as u32) as usize;
         for combo in 0..n_combos {
-            let mut c = vec![0usize; k];
+            let mut c = vec![0u8; k];
             c[lead] = 1;
             let mut t = combo;
             for pos in (lead + 1)..k {
-                c[pos] = t % q;
+                c[pos] = (t % q) as u8;
                 t /= q;
             }
             cols.push(c);
@@ -114,10 +114,10 @@ fn enumerate_directions(q: usize, k: usize) -> Vec<Vec<usize>> {
     cols
 }
 
-fn idx_to_tuple(mut idx: usize, q: usize, k: usize) -> Vec<usize> {
-    let mut out = vec![0usize; k];
+fn idx_to_tuple(mut idx: usize, q: usize, k: usize) -> Vec<u8> {
+    let mut out = vec![0u8; k];
     for i in 0..k {
-        out[i] = idx % q;
+        out[i] = (idx % q) as u8;
         idx /= q;
     }
     out

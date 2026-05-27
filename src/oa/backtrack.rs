@@ -41,7 +41,7 @@ pub fn try_construct(levels: &[usize]) -> Result<Option<Selected>> {
 }
 
 /// Public so the test in `super::tests` can exercise the search engine.
-pub fn search(n: usize, levels: &[usize]) -> Option<Vec<Vec<usize>>> {
+pub fn search(n: usize, levels: &[usize]) -> Option<Vec<Vec<u8>>> {
     if levels.is_empty() {
         return Some(vec![vec![]; n]);
     }
@@ -58,7 +58,7 @@ pub fn search(n: usize, levels: &[usize]) -> Option<Vec<Vec<usize>>> {
             }
         }
     }
-    let mut cols: Vec<Vec<usize>> = Vec::new();
+    let mut cols: Vec<Vec<u8>> = Vec::new();
     if extend(&mut cols, n, levels) {
         Some(transpose(&cols, n))
     } else {
@@ -66,7 +66,7 @@ pub fn search(n: usize, levels: &[usize]) -> Option<Vec<Vec<usize>>> {
     }
 }
 
-fn extend(cols: &mut Vec<Vec<usize>>, n: usize, remaining: &[usize]) -> bool {
+fn extend(cols: &mut Vec<Vec<u8>>, n: usize, remaining: &[usize]) -> bool {
     if remaining.is_empty() {
         return true;
     }
@@ -88,12 +88,12 @@ fn extend(cols: &mut Vec<Vec<usize>>, n: usize, remaining: &[usize]) -> bool {
     false
 }
 
-fn canonical_first(n: usize, q: usize) -> Vec<usize> {
+fn canonical_first(n: usize, q: usize) -> Vec<u8> {
     let per = n / q;
     let mut out = Vec::with_capacity(n);
     for level in 0..q {
         for _ in 0..per {
-            out.push(level);
+            out.push(level as u8);
         }
     }
     out
@@ -101,10 +101,10 @@ fn canonical_first(n: usize, q: usize) -> Vec<usize> {
 
 /// All distinct n-length sequences using each of 0..q exactly n/q times.
 /// Generated lexicographically. Bounded by multinomial(n; n/q, …, n/q).
-fn gen_balanced(n: usize, q: usize) -> Vec<Vec<usize>> {
+fn gen_balanced(n: usize, q: usize) -> Vec<Vec<u8>> {
     let per = n / q;
     let mut counts = vec![per; q];
-    let mut current = vec![0usize; n];
+    let mut current = vec![0u8; n];
     let mut out = Vec::new();
     fill(0, &mut counts, &mut current, &mut out, n);
     out
@@ -113,8 +113,8 @@ fn gen_balanced(n: usize, q: usize) -> Vec<Vec<usize>> {
 fn fill(
     pos: usize,
     counts: &mut [usize],
-    current: &mut [usize],
-    out: &mut Vec<Vec<usize>>,
+    current: &mut [u8],
+    out: &mut Vec<Vec<u8>>,
     n: usize,
 ) {
     if pos == n {
@@ -126,15 +126,15 @@ fn fill(
             continue;
         }
         counts[level] -= 1;
-        current[pos] = level;
+        current[pos] = level as u8;
         fill(pos + 1, counts, current, out, n);
         counts[level] += 1;
     }
 }
 
-fn check_pairs(cand: &[usize], placed: &[Vec<usize>], q: usize) -> bool {
+fn check_pairs(cand: &[u8], placed: &[Vec<u8>], q: usize) -> bool {
     for col in placed {
-        let qj = *col.iter().max().unwrap_or(&0) + 1;
+        let qj = (*col.iter().max().unwrap_or(&0) as usize) + 1;
         let n = cand.len();
         let expected = n / (q * qj);
         if n != expected * q * qj {
@@ -142,7 +142,7 @@ fn check_pairs(cand: &[usize], placed: &[Vec<usize>], q: usize) -> bool {
         }
         let mut counts = vec![0usize; q * qj];
         for i in 0..n {
-            counts[cand[i] * qj + col[i]] += 1;
+            counts[cand[i] as usize * qj + col[i] as usize] += 1;
         }
         if counts.iter().any(|&c| c != expected) {
             return false;
@@ -151,9 +151,9 @@ fn check_pairs(cand: &[usize], placed: &[Vec<usize>], q: usize) -> bool {
     true
 }
 
-fn transpose(cols: &[Vec<usize>], n: usize) -> Vec<Vec<usize>> {
+fn transpose(cols: &[Vec<u8>], n: usize) -> Vec<Vec<u8>> {
     let k = cols.len();
-    let mut rows = vec![vec![0usize; k]; n];
+    let mut rows = vec![vec![0u8; k]; n];
     for (ci, col) in cols.iter().enumerate() {
         for (ri, &v) in col.iter().enumerate() {
             rows[ri][ci] = v;
