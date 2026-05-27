@@ -9,23 +9,33 @@ fn mkfac(name: &str, n: usize) -> Factor {
 }
 
 /// Bush construction at increasing (q, k). Each emits N = q^k rows by
-/// (q^k - 1)/(q - 1) columns.
+/// (q^k - 1)/(q - 1) columns. Throughput is in cells/sec; observed ≈
+/// 35–115 M cells/s on a modern x86_64 with cache-bound GF table lookups.
 fn bench_bush_raw(c: &mut Criterion) {
     let mut group = c.benchmark_group("bush_raw");
     group.measurement_time(Duration::from_secs(8));
-    group.sample_size(20);
+    group.sample_size(10);
     let cases: &[(usize, usize)] = &[
-        (2, 4),   // L16, 15 cols
-        (2, 6),   // L64, 63 cols
-        (2, 8),   // L256, 255 cols
-        (2, 10),  // L1024, 1023 cols
-        (2, 12),  // L4096, 4095 cols
-        (3, 4),   // L81, 40 cols
-        (3, 6),   // L729, 364 cols
-        (4, 3),   // L64, 21 cols  — GF(4) prime power
-        (4, 4),   // L256, 85 cols — GF(4) prime power
-        (5, 4),   // L625, 156 cols
-        (7, 3),   // L343, 57 cols
+        // Small / sub-ms
+        (2, 4),   // L16
+        (2, 6),   // L64
+        (2, 8),   // L256
+        (3, 4),   // L81
+        (4, 3),   // L64  via GF(4)
+        (5, 4),   // L625
+        (7, 3),   // L343
+        // Medium / single-digit ms
+        (2, 10),  // L1024
+        (3, 6),   // L729
+        (4, 4),   // L256 via GF(4)
+        // Large — practical Taguchi extreme
+        (2, 12),  // L4096
+        (3, 7),   // L2187
+        (5, 5),   // L3125
+        (7, 4),   // L2401
+        // Huge — for headroom measurement only
+        (2, 13),  // L8192
+        (3, 8),   // L6561
     ];
     for &(q, k) in cases {
         let n = (q as u64).pow(k as u32) as usize;
