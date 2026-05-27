@@ -2,10 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-mod analyze;
-mod construct;
-mod factor;
-mod oa;
+use taguchi::{analyze, construct};
 
 #[derive(Parser)]
 #[command(
