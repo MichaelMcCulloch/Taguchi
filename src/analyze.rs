@@ -378,10 +378,12 @@ fn analyze_result(
                 a.p = Some(0.0);
             }
         }
-        a.significant = args.tolerate_noise.map_or_else(
-            || a.p.is_some_and(|p| p < args.alpha),
-            |sigma| effect_range(&model.terms[t], data) > sigma,
-        );
+        // Spec step 9: p < alpha, or (with --tolerate-noise) an effect range
+        // above sigma. The noise floor adds evidence; it never removes it.
+        a.significant = a.p.is_some_and(|p| p < args.alpha)
+            || args
+                .tolerate_noise
+                .is_some_and(|sigma| effect_range(&model.terms[t], data) > sigma);
     }
     let active = |s: &ColumnSource| !matches!(s,ColumnSource::Term{term} if anova[*term].pooled);
     let x = subset(&mm, active);
@@ -1376,5 +1378,21 @@ mod tests {
         assert!(r.anova[2].significant);
         a.tolerate_noise = Some(4.0);
         assert!(!has_evidence(&fit(&d, &data, &a)));
+    }
+
+    #[test]
+    fn tolerate_noise_never_removes_f_test_evidence() {
+        // Two replicates give residual df, so `a` has p < alpha. A noise
+        // floor far above its effect range must not switch it off.
+        let d = design(&["a", "b"], "a + b");
+        let data = factorial(&d, 2, |v, i| 10.0 + 5.0 * v[0] + 0.01 * i as f64);
+        let mut a = args();
+        let r = fit(&d, &data, &a);
+        assert!(r.anova[0].p.is_some_and(|p| p < 0.05));
+        assert!(r.anova[0].significant);
+        a.tolerate_noise = Some(100.0);
+        let r = fit(&d, &data, &a);
+        assert!(r.anova[0].significant);
+        assert!(has_evidence(&r));
     }
 }
