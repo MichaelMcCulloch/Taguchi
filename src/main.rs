@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use taguchi::{analyze, construct};
+use taguchi::{analyze, augment, construct};
 
 #[derive(Parser)]
 #[command(
@@ -57,6 +57,31 @@ enum Cmd {
         #[arg(long, default_value_t = 0.05)]
         alpha: f64,
     },
+    /// Propose additional runs that resolve an alias or improve the precision
+    /// of a chosen interaction, keeping every completed result.
+    Augment {
+        /// Input CSV (the design so far; completed rows are the base).
+        csv: PathBuf,
+        /// Override design sidecar path (defaults to <csv-stem>.design.json).
+        #[arg(short, long)]
+        design: Option<PathBuf>,
+        /// Term to make estimable, e.g. --for a:b. Repeatable.
+        /// Default: every non-estimable term of the model.
+        #[arg(long = "for", value_name = "TERM")]
+        targets: Vec<String>,
+        /// Number of runs to add. Required when every term is already estimable.
+        #[arg(long)]
+        runs: Option<usize>,
+        /// Seed for candidate sampling; defaults to the design's randomization seed.
+        #[arg(long)]
+        seed: Option<u64>,
+        /// Use rows with empty results as part of the base as well.
+        #[arg(long)]
+        include_pending: bool,
+        /// Output CSV path. A sidecar <stem>.design.json is also written.
+        #[arg(short, long)]
+        output: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -80,6 +105,23 @@ fn main() -> Result<()> {
             minimize,
             tolerate_noise,
             alpha,
+        }),
+        Cmd::Augment {
+            csv,
+            design,
+            targets,
+            runs,
+            seed,
+            include_pending,
+            output,
+        } => augment::run_augment(augment::AugmentArgs {
+            csv_path: csv,
+            design_path: design,
+            targets,
+            runs,
+            seed,
+            include_pending,
+            output,
         }),
     }
 }
