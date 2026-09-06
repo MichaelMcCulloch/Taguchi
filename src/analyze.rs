@@ -1,11 +1,11 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use statrs::distribution::{ContinuousCDF, FisherSnedecor, StudentsT};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs::File;
 use std::path::PathBuf;
 
-use crate::construct::{sidecar_path, Design};
+use crate::construct::{Design, sidecar_path};
 use crate::factor::FactorValue;
 use crate::model::{self, Cell, ColumnSource, Fit, Model, ModelMatrix};
 use crate::report::*;
@@ -982,9 +982,10 @@ mod tests {
         assert!(r.estimability.terms[2].lost);
         let text = render_result(&r, 0.05);
         assert!(text.contains("Missing runs (1): r0004"));
-        assert!(text
-            .lines()
-            .any(|line| line.contains("a:b") && line.contains("LOST (missing runs)")));
+        assert!(
+            text.lines()
+                .any(|line| line.contains("a:b") && line.contains("LOST (missing runs)"))
+        );
         assert!(text.contains("n/e"));
         assert_eq!(r.predictions.iter().filter(|p| p.measured).count(), 3);
         assert!(!r.predictions[3].estimable);
