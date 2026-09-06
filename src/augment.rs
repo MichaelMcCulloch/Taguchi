@@ -65,11 +65,20 @@ pub fn run_augment(args: AugmentArgs) -> Result<()> {
 
 // ---------------------------------------------------------------- input ----
 
-/// Column positions in the input CSV. v1 files carry `experiment` instead of
-/// `run_id`/`order`; both shapes are accepted.
+/// Column positions in the input CSV, plus the file's own bytes. v1 files carry
+/// `experiment` instead of `run_id`/`order`; both shapes are accepted. The raw
+/// bytes and per-record ranges let the output repeat the header and the
+/// original rows exactly as they were written, quoting and all.
 struct Table {
     headers: csv::StringRecord,
     rows: Vec<csv::StringRecord>,
+    raw: Vec<u8>,
+    /// Byte range of the header record, terminator included.
+    header_range: (usize, usize),
+    /// Byte range of each data record, terminator included.
+    row_ranges: Vec<(usize, usize)>,
+    /// True when the file's records end with CRLF.
+    crlf: bool,
     factor_col: Vec<usize>,
     role_col: Vec<usize>,
     result_col: Vec<usize>,
@@ -80,10 +89,38 @@ struct Table {
 }
 
 fn read_table(path: &Path, design: &Design) -> Result<Table> {
-    let mut rdr =
-        csv::Reader::from_path(path).with_context(|| format!("opening {}", path.display()))?;
-    let headers = rdr.headers()?.clone();
-    let rows: Vec<csv::StringRecord> = rdr.records().collect::<std::result::Result<_, _>>()?;
+    let raw = std::fs::read(path).with_context(|| format!("opening {}", path.display()))?;
+    // has_headers(false) so the header record carries a byte position too.
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .from_reader(&raw[..]);
+    let mut records: Vec<csv::StringRecord> = Vec::new();
+    let mut starts: Vec<usize> = Vec::new();
+    for record in rdr.records() {
+        let record = record.with_context(|| format!("reading {}", path.display()))?;
+        starts.push(
+            record
+                .position()
+                .expect("csv records carry a byte position")
+                .byte() as usize,
+        );
+        records.push(record);
+    }
+    if records.is_empty() {
+        bail!("{} has no header row", path.display());
+    }
+    let ranges: Vec<(usize, usize)> = (0..records.len())
+        .map(|i| (starts[i], starts.get(i + 1).copied().unwrap_or(raw.len())))
+        .collect();
+    let headers = records.remove(0);
+    let header_range = ranges[0];
+    let row_ranges = ranges[1..].to_vec();
+    // The file's own line ending, taken from its first terminator.
+    let crlf = raw
+        .iter()
+        .position(|&b| b == b'\n')
+        .is_some_and(|i| i > 0 && raw[i - 1] == b'\r');
+    let rows = records;
 
     let find = |name: &str| headers.iter().position(|h| h == name);
     let factor_col: Vec<usize> = design
@@ -101,7 +138,13 @@ fn read_table(path: &Path, design: &Design) -> Result<Table> {
         .iter()
         .map(|r| find(r).ok_or_else(|| anyhow!("result column '{}' not in CSV", r)))
         .collect::<Result<_>>()?;
-    let unit_col = design.unit.as_ref().and_then(|u| find(&u.name));
+    // A declared unit needs its column: without it the augmented rows would
+    // silently drop the pairing the design depends on.
+    let unit_col = design
+        .unit
+        .as_ref()
+        .map(|u| find(&u.name).ok_or_else(|| anyhow!("unit column '{}' not in CSV", u.name)))
+        .transpose()?;
 
     // A factor or result may legitimately be named "run_id"; do not steal it.
     let taken: Vec<usize> = factor_col
@@ -116,9 +159,28 @@ fn read_table(path: &Path, design: &Design) -> Result<Table> {
     let order_col = free("order");
     let experiment_col = run_id_col.is_none().then(|| free("experiment")).flatten();
 
+    // A malformed order would otherwise vanish into `max()` and the new rows
+    // would continue a sequence that is not the file's.
+    if let Some(col) = order_col {
+        for (i, row) in rows.iter().enumerate() {
+            let cell = row.get(col).unwrap_or("").trim();
+            if cell.parse::<usize>().is_err() {
+                bail!(
+                    "row {}: order '{}' is not a non-negative integer",
+                    i + 2,
+                    cell
+                );
+            }
+        }
+    }
+
     Ok(Table {
         headers,
         rows,
+        raw,
+        header_range,
+        row_ranges,
+        crlf,
         factor_col,
         role_col,
         result_col,
@@ -238,7 +300,17 @@ struct Candidates {
     sampled: Option<(usize, u128)>,
 }
 
-fn candidate_cells(factors: &[Factor], roles: &[ReplicateRole], rng: &mut Rng) -> Candidates {
+/// The candidate set: the full factorial of factor levels × replicate levels,
+/// or, above `cap`, exactly `cap` distinct combinations drawn uniformly
+/// without replacement. Rejection sampling gives a uniformly random subset of
+/// the required size: each draw is uniform over the factorial, and repeats are
+/// discarded rather than shrinking the sample.
+fn candidate_cells(
+    factors: &[Factor],
+    roles: &[ReplicateRole],
+    rng: &mut Rng,
+    cap: usize,
+) -> Candidates {
     let dims: Vec<usize> = factors
         .iter()
         .map(Factor::level_count)
@@ -247,7 +319,7 @@ fn candidate_cells(factors: &[Factor], roles: &[ReplicateRole], rng: &mut Rng) -
     let n_factors = factors.len();
     let total: u128 = dims.iter().map(|&d| d as u128).product();
 
-    if total <= CANDIDATE_CAP as u128 {
+    if total <= cap as u128 {
         let mut rows: Vec<Vec<usize>> = vec![Vec::new()];
         for &d in &dims {
             rows = rows
@@ -267,20 +339,47 @@ fn candidate_cells(factors: &[Factor], roles: &[ReplicateRole], rng: &mut Rng) -
         };
     }
 
-    // Above the cap: CANDIDATE_CAP uniform draws, kept in draw order, deduped.
-    let mut seen = std::collections::HashSet::new();
-    let mut cells = Vec::new();
-    for _ in 0..CANDIDATE_CAP {
-        let draw: Vec<usize> = dims.iter().map(|&d| rng.below(d as u64) as usize).collect();
-        if seen.insert(draw.clone()) {
-            cells.push(split_cell(&draw, n_factors));
+    let mut draws: Vec<Vec<usize>> = if total <= 4 * cap as u128 {
+        // Close to the cap, rejection sampling would spend most of its draws
+        // on repeats, so shuffle the enumeration indices instead: a partial
+        // Fisher-Yates picks `cap` of them without replacement in one pass.
+        let mut indices: Vec<u64> = (0..total as u64).collect();
+        for i in 0..cap {
+            let j = i + rng.below((indices.len() - i) as u64) as usize;
+            indices.swap(i, j);
         }
-    }
-    let kept = cells.len();
+        indices.truncate(cap);
+        indices.iter().map(|&i| decode(i, &dims)).collect()
+    } else {
+        // Far above the cap, repeats are rare, so draw coordinates directly
+        // and discard the few collisions.
+        let mut seen = std::collections::HashSet::new();
+        let mut drawn = Vec::with_capacity(cap);
+        while drawn.len() < cap {
+            let draw: Vec<usize> = dims.iter().map(|&d| rng.below(d as u64) as usize).collect();
+            if seen.insert(draw.clone()) {
+                drawn.push(draw);
+            }
+        }
+        drawn
+    };
+    // Keep the sample in factorial enumeration order, so that the greedy
+    // loop's "ties by enumeration order" rule means the same thing here.
+    draws.sort_unstable();
     Candidates {
-        cells,
-        sampled: Some((kept, total)),
+        cells: draws.iter().map(|d| split_cell(d, n_factors)).collect(),
+        sampled: Some((cap, total)),
     }
+}
+
+/// The mixed-radix level vector at one index of the factorial enumeration.
+fn decode(mut index: u64, dims: &[usize]) -> Vec<usize> {
+    let mut levels = vec![0usize; dims.len()];
+    for (slot, &d) in levels.iter_mut().zip(dims).rev() {
+        *slot = (index % d as u64) as usize;
+        index /= d as u64;
+    }
+    levels
 }
 
 fn split_cell(indices: &[usize], n_factors: usize) -> Cell {
@@ -385,6 +484,56 @@ fn quadratic_form(inverse: &DMatrix<f64>, x: &[f64]) -> f64 {
 }
 
 // ---------------------------------------------------------------- output ----
+
+/// Byte ranges of each field in one raw CSV record, quoting respected. The
+/// record may carry its line terminator; scanning stops before it.
+fn field_ranges(record: &[u8], delimiter: u8) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let mut quoted = false;
+    while i < record.len() {
+        let byte = record[i];
+        if quoted {
+            if byte == b'"' {
+                if record.get(i + 1) == Some(&b'"') {
+                    i += 2;
+                    continue;
+                }
+                quoted = false;
+            }
+            i += 1;
+        } else if byte == b'"' {
+            quoted = true;
+            i += 1;
+        } else if byte == b'\r' || byte == b'\n' {
+            break;
+        } else if byte == delimiter {
+            ranges.push((start, i));
+            i += 1;
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    ranges.push((start, i));
+    ranges
+}
+
+/// One record's own bytes, with the line terminator trimmed from either end.
+/// The csv reader reports a record's start position between the CR and the LF
+/// of a CRLF pair, so neither edge can be trusted to be clean.
+fn record_bytes(raw: &[u8], (start, end): (usize, usize)) -> &[u8] {
+    let mut start = start;
+    let mut end = end;
+    while start < end && (raw[start] == b'\n' || raw[start] == b'\r') {
+        start += 1;
+    }
+    while end > start && (raw[end - 1] == b'\n' || raw[end - 1] == b'\r') {
+        end -= 1;
+    }
+    &raw[start..end]
+}
 
 fn parse_id(prefix: char, s: &str) -> Option<(usize, usize)> {
     let digits = s.strip_prefix(prefix)?;
@@ -686,7 +835,7 @@ pub fn augment(args: AugmentArgs) -> Result<Outcome> {
     }
 
     // Step 2: the candidate set.
-    let candidates = candidate_cells(&design.factors, &design.replicates, &mut rng);
+    let candidates = candidate_cells(&design.factors, &design.replicates, &mut rng, CANDIDATE_CAP);
     if let Some((kept, total)) = candidates.sampled {
         println!(
             "Candidates: {} sampled uniformly with seed {} from {} combinations (cap {})",
@@ -821,22 +970,34 @@ pub fn augment(args: AugmentArgs) -> Result<Outcome> {
             + 1
     });
 
-    let mut wtr = csv::Writer::from_path(&args.output)
-        .with_context(|| format!("creating {}", args.output.display()))?;
-    wtr.write_record(&table.headers)?;
-    for (i, row) in table.rows.iter().enumerate() {
+    // The header and the original rows are copied from the input's own bytes,
+    // so quoting, spacing and line endings survive unchanged. The one edit
+    // allowed is the run-id widening rewrite, and it touches only that field.
+    let terminator: &[u8] = if table.crlf { b"\r\n" } else { b"\n" };
+    let mut out: Vec<u8> = Vec::with_capacity(table.raw.len() * 2);
+    out.extend_from_slice(record_bytes(&table.raw, table.header_range));
+    out.extend_from_slice(terminator);
+    for (i, &range) in table.row_ranges.iter().enumerate() {
+        let record = record_bytes(&table.raw, range);
         match (&plan.rewritten, table.run_id_col) {
             (Some(ids), Some(col)) => {
-                let cells: Vec<&str> = row
-                    .iter()
-                    .enumerate()
-                    .map(|(j, cell)| if j == col { ids[i].as_str() } else { cell })
-                    .collect();
-                wtr.write_record(&cells)?;
+                let fields = field_ranges(record, b',');
+                let (field_start, field_end) = fields[col];
+                out.extend_from_slice(&record[..field_start]);
+                out.extend_from_slice(ids[i].as_bytes());
+                out.extend_from_slice(&record[field_end..]);
             }
-            _ => wtr.write_record(row)?,
+            _ => out.extend_from_slice(record),
         }
+        out.extend_from_slice(terminator);
     }
+    let mut wtr = csv::WriterBuilder::new()
+        .terminator(if table.crlf {
+            csv::Terminator::CRLF
+        } else {
+            csv::Terminator::Any(b'\n')
+        })
+        .from_writer(Vec::new());
     for (k, cell) in new_cells.iter().enumerate() {
         let record: Vec<String> = (0..table.headers.len())
             .map(|col| {
@@ -854,7 +1015,9 @@ pub fn augment(args: AugmentArgs) -> Result<Outcome> {
             .collect();
         wtr.write_record(&record)?;
     }
-    wtr.flush()?;
+    out.extend_from_slice(&wtr.into_inner()?);
+    std::fs::write(&args.output, &out)
+        .with_context(|| format!("creating {}", args.output.display()))?;
     println!("✓ wrote {}", args.output.display());
 
     let new_runs: Vec<Run> = new_cells
@@ -1072,6 +1235,22 @@ mod tests {
         serde_json::from_reader(File::open(path).unwrap()).unwrap()
     }
 
+    /// Unregularized det(X'X) for every row of a design CSV, read back from
+    /// disk through the same loader the command uses.
+    fn det_xtx(csv: &Path) -> f64 {
+        let design: Design =
+            serde_json::from_reader(File::open(sidecar_path(csv)).unwrap()).unwrap();
+        let table = read_table(csv, &design).unwrap();
+        let model = union_model(&design, &[]).unwrap();
+        let cells: Vec<Cell> = (0..table.rows.len())
+            .map(|i| row_cell(&table, &design, i).unwrap())
+            .collect();
+        let mm = model_matrix(&design.factors, &design.replicates, &model, &cells, None);
+        let p = mm.columns.len();
+        let x = DMatrix::from_fn(mm.data.len(), p, |i, j| mm.data[i][j]);
+        (x.transpose() * &x).determinant()
+    }
+
     fn args(csv: &Path, out: &Path) -> AugmentArgs {
         AugmentArgs {
             csv_path: csv.to_path_buf(),
@@ -1185,12 +1364,17 @@ mod tests {
         assert!(outcome.before.terms.iter().all(|t| t.estimable));
         assert_eq!(outcome.added, 4);
         assert!(outcome.targets_estimable);
+        // The acceptance line asks for det(X'X) itself, not the ridge-adjusted
+        // log det the greedy loop scores with.
+        let before = det_xtx(&csv);
+        let after = det_xtx(&out);
         assert!(
-            outcome.log_det_after > outcome.log_det_before,
+            after > before,
             "det(X'X) must grow: {} -> {}",
-            outcome.log_det_before,
-            outcome.log_det_after
+            before,
+            after
         );
+        assert!(before > 0.0, "the base design is not singular: {}", before);
         assert_eq!(outcome.run_ids, ["r0005", "r0006", "r0007", "r0008"]);
         assert_eq!(std::fs::read_to_string(&out).unwrap().lines().count(), 9);
     }
@@ -1488,5 +1672,339 @@ mod tests {
         assert!(lines[1].starts_with("r09996,"), "got {}", lines[1]);
         assert!(lines[4].starts_with("r09999,"), "got {}", lines[4]);
         assert!(lines[5].starts_with("r10000,"), "got {}", lines[5]);
+    }
+
+    // ---- Fix-up 1: sampling above the cap -------------------------------
+
+    /// Above the cap the sample holds exactly `cap` DISTINCT combinations, not
+    /// however many survive deduplication.
+    #[test]
+    fn capped_sampling_keeps_exactly_cap_distinct_cells() {
+        let factors = two_level(&["a", "b", "c", "d", "e", "f", "g", "h"]);
+        let total = 1u128 << 8; // 256 combinations
+        for cap in [7usize, 200, 255] {
+            let mut rng = Rng::new(4);
+            let picked = candidate_cells(&factors, &[], &mut rng, cap);
+            if cap as u128 >= total {
+                assert!(picked.sampled.is_none(), "cap {} is not below total", cap);
+                assert_eq!(picked.cells.len(), total as usize);
+                continue;
+            }
+            assert_eq!(picked.sampled, Some((cap, total)), "cap {}", cap);
+            assert_eq!(picked.cells.len(), cap, "cap {}", cap);
+            let distinct: std::collections::HashSet<_> = picked
+                .cells
+                .iter()
+                .map(|c| c.factor_levels.clone())
+                .collect();
+            assert_eq!(distinct.len(), cap, "duplicates at cap {}", cap);
+        }
+    }
+
+    /// Near the cap — 255 of 256 — the loop still returns the full sample, and
+    /// the draw is uniform: every combination but one appears.
+    #[test]
+    fn near_cap_sampling_is_complete_and_seed_dependent() {
+        let factors = two_level(&["a", "b", "c", "d", "e", "f", "g", "h"]);
+        let sample = |seed: u64| {
+            let mut rng = Rng::new(seed);
+            candidate_cells(&factors, &[], &mut rng, 255)
+                .cells
+                .into_iter()
+                .map(|c| c.factor_levels)
+                .collect::<Vec<_>>()
+        };
+        let first = sample(2);
+        assert_eq!(first.len(), 255);
+        let distinct: std::collections::HashSet<_> = first.iter().cloned().collect();
+        assert_eq!(distinct.len(), 255, "255 of 256 must all differ");
+        // Same seed, same sample; a different seed leaves out a different cell.
+        assert_eq!(first, sample(2));
+        let second = sample(99);
+        let other: std::collections::HashSet<_> = second.iter().cloned().collect();
+        assert_ne!(
+            distinct, other,
+            "a different seed must omit a different cell"
+        );
+    }
+
+    // ---- Fix-up 2: the original bytes survive ---------------------------
+
+    /// Quoted fields, spacing and CRLF endings are copied through untouched.
+    #[test]
+    fn original_rows_are_preserved_byte_for_byte() {
+        let dir = Scratch::new("verbatim");
+        let csv = dir.at("exp.csv");
+        let out = dir.at("aug.csv");
+        // Quoted header cell, a quoted field holding a comma, padded numbers,
+        // CRLF endings, and no terminator on the last line.
+        let source = "run_id,order,a,b,\"y\"\r\n\
+                      r0001,1,1,1,\"1,5\"\r\n\
+                      r0002,2,1,2,2.0\r\n\
+                      r0003,3,2,1,\"quoted, too\"\r\n\
+                      r0004,4,2,2,4.0";
+        std::fs::write(&csv, source).unwrap();
+        put_design(&csv, &fixture_design(&["a", "b"], &["y ~ a + b + a:b"]));
+
+        let outcome = augment(AugmentArgs {
+            runs: Some(1),
+            ..args(&csv, &out)
+        })
+        .unwrap();
+        assert!(!outcome.renumbered);
+        let written = std::fs::read(&out).unwrap();
+        // Everything the input held is still there, byte for byte.
+        assert!(
+            written.starts_with(source.as_bytes()),
+            "original bytes changed:\n{}",
+            String::from_utf8_lossy(&written)
+        );
+        let tail = String::from_utf8(written[source.len()..].to_vec()).unwrap();
+        assert_eq!(tail, "\r\nr0005,5,1,1,\r\n", "new row: {:?}", tail);
+    }
+
+    /// Widening rewrites the run_id field and nothing else on the line.
+    #[test]
+    fn widening_touches_only_the_run_id_field() {
+        let dir = Scratch::new("widen-bytes");
+        let csv = dir.at("exp.csv");
+        let out = dir.at("aug.csv");
+        let source = "run_id,order,a,b,y\n\
+                      r9998,1,1,1,\"1,5\"\n\
+                      r9999,2,1,2,2.0\n";
+        std::fs::write(&csv, source).unwrap();
+        put_design(&csv, &fixture_design(&["a", "b"], &["y ~ a + b + a:b"]));
+        let outcome = augment(AugmentArgs {
+            runs: Some(2),
+            ..args(&csv, &out)
+        })
+        .unwrap();
+        assert!(outcome.renumbered);
+        let text = std::fs::read_to_string(&out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "run_id,order,a,b,y");
+        // The quoted cell keeps its quotes; only the id widened.
+        assert_eq!(lines[1], "r09998,1,1,1,\"1,5\"");
+        assert_eq!(lines[2], "r09999,2,1,2,2.0");
+        assert_eq!(outcome.run_ids, ["r10000", "r10001"]);
+    }
+
+    /// The field scanner the widening rewrite depends on.
+    #[test]
+    fn field_ranges_respect_quoting() {
+        let record = b"a,\"b,c\",\"say \"\"hi\"\"\",d\r\n";
+        let ranges = field_ranges(record, b',');
+        let fields: Vec<&str> = ranges
+            .iter()
+            .map(|&(s, e)| std::str::from_utf8(&record[s..e]).unwrap())
+            .collect();
+        assert_eq!(fields, ["a", "\"b,c\"", "\"say \"\"hi\"\"\"", "d"]);
+    }
+
+    // ---- Fix-up 3: neither failure looks like absence --------------------
+
+    #[test]
+    fn non_numeric_order_is_refused() {
+        let dir = Scratch::new("badorder");
+        let csv = dir.at("exp.csv");
+        put(
+            &csv,
+            "run_id,order,a,b,y\n\
+             r0001,1,1,1,1.0\n\
+             r0002,two,1,2,2.0\n\
+             r0003,3,2,1,3.0\n\
+             r0004,4,2,2,4.0\n",
+        );
+        put_design(&csv, &fixture_design(&["a", "b"], &["y ~ a + b + a:b"]));
+        let err = augment(AugmentArgs {
+            runs: Some(1),
+            ..args(&csv, &dir.at("aug.csv"))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("order 'two'"), "got: {}", err);
+        assert!(!dir.at("aug.csv").exists(), "nothing must be written");
+    }
+
+    #[test]
+    fn missing_unit_column_is_refused() {
+        let dir = Scratch::new("nounit");
+        let csv = dir.at("exp.csv");
+        put(
+            &csv,
+            "run_id,order,a,m,y\n\
+             r0001,1,1,1,1.0\n\
+             r0002,2,1,2,1.5\n\
+             r0003,3,2,1,2.0\n\
+             r0004,4,2,2,2.5\n",
+        );
+        let mut design = fixture_design(&["a", "m"], &["y ~ a + m + a:m"]);
+        design.unit = Some(Unit {
+            name: "checkpoint".into(),
+            key: vec!["a".into()],
+        });
+        put_design(&csv, &design);
+        let err = augment(AugmentArgs {
+            runs: Some(1),
+            ..args(&csv, &dir.at("aug.csv"))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unit column 'checkpoint'"), "got: {}", err);
+        assert!(!dir.at("aug.csv").exists(), "nothing must be written");
+    }
+
+    // ---- Fix-up 5: the two claims are now under test ---------------------
+
+    /// The deviation claims the `n_params` bound "never cuts a reachable
+    /// solution short". The worst case is an empty base: a saturated 3×3 model
+    /// then needs exactly `n_params` rows, and the loop delivers them.
+    #[test]
+    fn the_n_params_bound_reaches_a_saturated_model_from_nothing() {
+        let dir = Scratch::new("bound");
+        let csv = dir.at("exp.csv");
+        let out = dir.at("aug.csv");
+        // Every result cell empty: with pending rows excluded the base is empty.
+        put(
+            &csv,
+            "run_id,order,a,b,y\n\
+             r0001,1,1,1,\n\
+             r0002,2,1,2,\n",
+        );
+        let mut design = fixture_design(&["a", "b"], &["y ~ a + b + a:b"]);
+        design.factors = ["a", "b"]
+            .iter()
+            .map(|n| Factor::parse(n, "d[1,2,3]").unwrap())
+            .collect();
+        design.models = vec![Model::parse("y ~ a + b + a:b", &design.factors).unwrap()];
+        put_design(&csv, &design);
+
+        let outcome = augment(args(&csv, &out)).unwrap();
+        let p = outcome.before.n_params;
+        assert_eq!(p, 9, "1 + 2 + 2 + 4 columns");
+        assert_eq!(outcome.before.n_rows, 0, "the base must be empty");
+        assert!(
+            outcome.added <= p,
+            "the loop must stay inside the bound: {} > {}",
+            outcome.added,
+            p
+        );
+        assert_eq!(
+            outcome.added, p,
+            "the bound is exactly what this case needs"
+        );
+        assert!(
+            outcome.targets_estimable && outcome.after.terms.iter().all(|t| t.estimable),
+            "the bound must not cut the reachable solution short"
+        );
+    }
+
+    /// The same bound holds when only one row is already done.
+    #[test]
+    fn the_bound_also_covers_a_partly_filled_base() {
+        let dir = Scratch::new("bound2");
+        let csv = dir.at("exp.csv");
+        let out = dir.at("aug.csv");
+        put(&csv, "run_id,order,a,b,y\nr0001,1,1,1,1.0\n");
+        let mut design = fixture_design(&["a", "b"], &["y ~ a + b + a:b"]);
+        design.factors = ["a", "b"]
+            .iter()
+            .map(|n| Factor::parse(n, "d[1,2,3]").unwrap())
+            .collect();
+        design.models = vec![Model::parse("y ~ a + b + a:b", &design.factors).unwrap()];
+        put_design(&csv, &design);
+
+        let outcome = augment(args(&csv, &out)).unwrap();
+        assert_eq!(outcome.before.n_rows, 1);
+        assert_eq!(outcome.added, 8, "8 more rows complete the 3×3 grid");
+        assert!(outcome.added <= outcome.before.n_params);
+        assert!(outcome.after.terms.iter().all(|t| t.estimable));
+    }
+
+    /// `collect_units` reads every explicit id before it makes one, so a
+    /// generated id cannot take an id the file already uses.
+    #[test]
+    fn generated_unit_ids_cannot_collide_with_explicit_ones() {
+        let dir = Scratch::new("collide");
+        let csv = dir.at("exp.csv");
+        let out = dir.at("aug.csv");
+        // Row 1 has no unit id and would naively be given "u0001"; row 2
+        // already holds "u0001". The deferred pass must skip past it.
+        put(
+            &csv,
+            "run_id,order,a,m,checkpoint,y\n\
+             r0001,1,1,1,,1.0\n\
+             r0002,2,2,1,u0001,2.0\n",
+        );
+        let mut design = fixture_design(&["a", "m"], &["y ~ a + m + a:m"]);
+        design.unit = Some(Unit {
+            name: "checkpoint".into(),
+            key: vec!["a".into()],
+        });
+        put_design(&csv, &design);
+
+        let outcome = augment(AugmentArgs {
+            runs: Some(2),
+            ..args(&csv, &out)
+        })
+        .unwrap();
+        assert_eq!(outcome.added, 2);
+        let text = std::fs::read_to_string(&out).unwrap();
+        let new_rows: Vec<Vec<&str>> = text
+            .lines()
+            .skip(3)
+            .map(|l| l.split(',').collect())
+            .collect();
+        assert_eq!(new_rows.len(), 2);
+        for row in &new_rows {
+            // a = 1 is the key that had no id; it must NOT have been given u0001.
+            let expected = if row[2] == "1" { "u0002" } else { "u0001" };
+            assert_eq!(row[4], expected, "unit id collided in {:?}", row);
+        }
+        let side = read_json(&sidecar_path(&out));
+        for run in side["runs"].as_array().unwrap() {
+            let unit = run["unit"].as_str().unwrap();
+            let a_is_one = run["factors"]["a"] == 1;
+            assert_eq!(unit, if a_is_one { "u0002" } else { "u0001" });
+        }
+    }
+
+    /// The Fisher-Yates branch decodes indices; the decoding must agree with
+    /// the enumeration the full-factorial branch produces.
+    #[test]
+    fn decode_matches_the_factorial_enumeration_order() {
+        let factors = vec![
+            Factor::parse("a", "d[1,2]").unwrap(),
+            Factor::parse("b", "d[1,2,3]").unwrap(),
+            Factor::parse("c", "d[1,2,3,4]").unwrap(),
+        ];
+        let dims = [2usize, 3, 4];
+        let mut rng = Rng::new(0);
+        let full = candidate_cells(&factors, &[], &mut rng, 1000);
+        assert!(full.sampled.is_none());
+        assert_eq!(full.cells.len(), 24);
+        for (i, cell) in full.cells.iter().enumerate() {
+            assert_eq!(decode(i as u64, &dims), cell.factor_levels, "index {}", i);
+        }
+    }
+
+    /// The validator's case: 2^18 combinations against the real cap must give
+    /// exactly 200 000 distinct candidates, not whatever survives dedup.
+    #[test]
+    fn the_real_cap_returns_exactly_two_hundred_thousand() {
+        let factors = two_level(&[
+            "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q",
+            "r",
+        ]);
+        let mut rng = Rng::new(5);
+        let picked = candidate_cells(&factors, &[], &mut rng, CANDIDATE_CAP);
+        assert_eq!(picked.sampled, Some((CANDIDATE_CAP, 1 << 18)));
+        assert_eq!(picked.cells.len(), CANDIDATE_CAP);
+        let distinct: std::collections::HashSet<_> = picked
+            .cells
+            .iter()
+            .map(|c| c.factor_levels.clone())
+            .collect();
+        assert_eq!(distinct.len(), CANDIDATE_CAP);
     }
 }
