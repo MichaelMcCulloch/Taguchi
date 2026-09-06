@@ -622,4 +622,4 @@ See `docs/SPEC-model-driven-design.md` for the contract this implements, and
 
 ## License
 
-Not specified yet — add one if you intend to redistribute.
+GNU Affero General Public License v3.0 — see `LICENSE` for the full text.
