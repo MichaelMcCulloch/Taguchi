@@ -224,9 +224,13 @@ pub fn estimability(mm: &ModelMatrix, model: &Model, factors: &[Factor]) -> Esti
 ```
 
 "Estimable" for a term T means: rank(X) − rank(X without T's columns) == df(T).
-`aliased_with` is computed from the null-space vectors that involve T's
-columns: every other term with a non-zero coefficient (|c| > 1e-8) in such a
-vector is listed. Numerical rank uses a tolerance of `1e-10 × max singular
+`aliased_with` is computed from a *pivoted* null-space basis of X (reduced
+row echelon form or column-pivoted QR; never an arbitrary SVD basis, which
+mixes independent aliases when the null space has more than one dimension):
+for each of T's columns that is dependent, list every other source with a
+non-zero coefficient (|c| > 1e-8) in its pivoted null vector. Sources are
+term labels, or `(Intercept)`, a replicate-role name, or `unit`, so that a
+non-estimable term never reports an empty list. Numerical rank uses a tolerance of `1e-10 × max singular
 value × max(n_rows, n_cols)`.
 
 ```rust
@@ -242,7 +246,7 @@ pub struct Fit {
     pub cov_unscaled: Option<Vec<Vec<f64>>>, // (X'X)^+ ; multiply by sigma² for coef covariance
 }
 pub fn fit_least_squares(x: &[Vec<f64>], y: &[f64]) -> Fit;
-pub fn is_estimable(x: &[Vec<f64>], v: &[f64]) -> bool;   // v in row space of X, same tolerance
+pub fn is_estimable(x: &[Vec<f64>], v: &[f64]) -> bool;   // v in row space of X: ||v - P v|| <= 1e-8 * max(||v||, 1), P = projector onto row space
 ```
 
 Linear algebra: the crate may add `nalgebra` (latest 0.33.x) as a dependency.
