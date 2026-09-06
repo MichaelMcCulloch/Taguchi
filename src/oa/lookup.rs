@@ -164,6 +164,92 @@ fn parse_body(body: &str, n_runs: usize, columns: &[usize]) -> Option<Vec<Vec<u8
     }
 }
 
+/// A catalog entry that can supply a requested level structure. Additive:
+/// `find` does not use it.
+#[derive(Debug, Clone)]
+pub struct CatalogRef {
+    pub name: String,
+    pub n_runs: usize,
+    /// Level count of every column in the entry, in catalog column order.
+    pub columns: Vec<usize>,
+    /// Position in the static catalog index.
+    entry: usize,
+}
+
+/// Every catalog entry whose column level multiset supplies `levels`, in
+/// ascending run count (the catalog index order).
+pub fn entries_supplying(levels: &[usize]) -> Vec<CatalogRef> {
+    if levels.is_empty() {
+        return Vec::new();
+    }
+    let mut need: BTreeMap<usize, usize> = BTreeMap::new();
+    for &l in levels {
+        *need.entry(l).or_insert(0) += 1;
+    }
+    index()
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            let mut have: BTreeMap<usize, usize> = BTreeMap::new();
+            for &l in &entry.columns {
+                *have.entry(l).or_insert(0) += 1;
+            }
+            need.iter()
+                .all(|(l, c)| have.get(l).copied().unwrap_or(0) >= *c)
+        })
+        .map(|(i, entry)| CatalogRef {
+            name: entry.name.clone(),
+            n_runs: entry.n_runs,
+            columns: entry.columns.clone(),
+            entry: i,
+        })
+        .collect()
+}
+
+/// Extract the catalog columns named by `assignment` (one column index per
+/// factor, in factor order).
+///
+/// # Panics
+/// When `assignment` names a column outside the entry, or names one twice.
+pub fn select_columns(entry: &CatalogRef, assignment: &[usize]) -> Selected {
+    let source = &index()[entry.entry];
+    assert!(
+        assignment.iter().all(|&c| c < source.columns.len()),
+        "column assignment out of range for {}",
+        source.name
+    );
+    assert!(
+        assignment
+            .iter()
+            .enumerate()
+            .all(|(i, c)| !assignment[..i].contains(c)),
+        "column assignment repeats a column of {}",
+        source.name
+    );
+    let array: Vec<Vec<u8>> = source
+        .array
+        .iter()
+        .map(|row| assignment.iter().map(|&c| row[c]).collect())
+        .collect();
+    let column_levels: Vec<usize> = assignment.iter().map(|&c| source.columns[c]).collect();
+    let cols: Vec<String> = assignment.iter().map(|&c| (c + 1).to_string()).collect();
+    Selected {
+        info: ArrayInfo {
+            rows: array.len(),
+            cols: column_levels.len(),
+            label: format!(
+                "L{} (Sloane {}, cols {})",
+                source.n_runs,
+                source.name,
+                cols.join(",")
+            ),
+            method: format!("Sloane lookup ({})", source.name),
+        },
+        array,
+        column_levels,
+    }
+}
+
 pub fn find(user_levels: &[usize]) -> Option<Selected> {
     if user_levels.is_empty() {
         return None;
@@ -259,6 +345,44 @@ mod tests {
         let sel = find(&levels).expect("L12 must be in catalog");
         assert_eq!(sel.array.len(), 12);
         verify_strength2(&sel.array, &sel.column_levels).unwrap();
+    }
+
+    #[test]
+    fn entries_supplying_and_select_columns() {
+        // Additive surface: every entry that can carry four 2-level factors,
+        // in ascending run count, and the columns extracted from one of them.
+        let entries = entries_supplying(&[2, 2, 2, 2]);
+        assert!(entries.len() > 5, "got {} entries", entries.len());
+        assert!(entries.windows(2).all(|w| w[0].n_runs <= w[1].n_runs));
+        assert!(entries.iter().all(|e| {
+            e.columns.iter().filter(|&&l| l == 2).count() >= 4 && e.columns.len() >= 4
+        }));
+        assert!(entries_supplying(&[]).is_empty());
+        assert!(entries_supplying(&[97]).is_empty(), "no 97-level columns");
+
+        let entry = entries.iter().find(|e| e.n_runs == 8).expect("an L8 entry");
+        let selected = select_columns(entry, &[3, 1, 0, 2]);
+        assert_eq!(selected.array.len(), 8);
+        assert_eq!(selected.column_levels, vec![2; 4]);
+        assert!(
+            selected.info.label.contains("cols 4,2,1,3"),
+            "{}",
+            selected.info.label
+        );
+        verify_strength2(&selected.array, &selected.column_levels).unwrap();
+        // The columns are the entry's own, in the order asked for.
+        let straight = select_columns(entry, &[0, 1, 2, 3]);
+        for (row, picked) in straight.array.iter().zip(&selected.array) {
+            assert_eq!(vec![row[3], row[1], row[0], row[2]], *picked);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "column assignment out of range")]
+    fn select_columns_rejects_a_bad_column() {
+        let entry = entries_supplying(&[2, 2]).into_iter().next().unwrap();
+        let out_of_range = entry.columns.len();
+        select_columns(&entry, &[0, out_of_range]);
     }
 
     #[test]
