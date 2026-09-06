@@ -15,9 +15,6 @@ nalgebra = "0.33"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-# tests/cli.rs reads the JSON the binary writes; integration tests cannot see
-# the crate's own [dependencies].
-serde_json = "1"
 
 [[bench]]
 name = "oa"
