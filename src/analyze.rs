@@ -259,19 +259,6 @@ fn analyze_result(
     let mm = model::model_matrix(&design.factors, &design.replicates, &model, &cells, None);
     let est = model::estimability(&mm, &model, &design.factors);
     let mut warnings = model::hierarchy_warnings(&model, &design.factors);
-    for term in &est.terms {
-        if !term.estimable
-            && design
-                .estimability
-                .as_ref()
-                .is_some_and(|e| e.terms.iter().any(|t| t.term == term.term && t.estimable))
-        {
-            warnings.push(format!(
-                "{}: LOST (missing runs)",
-                term.term.label(&design.factors)
-            ));
-        }
-    }
     let original_fit = model::fit_least_squares(&mm.data, &y);
     let mut strata = if let Some(unit) = &design.unit {
         let unit_mm = model::model_matrix(
@@ -391,11 +378,10 @@ fn analyze_result(
                 a.p = Some(0.0);
             }
         }
-        a.significant = est.terms[t].estimable
-            && args.tolerate_noise.map_or_else(
-                || a.p.is_some_and(|p| p < args.alpha),
-                |sigma| effect_range(&model.terms[t], data) > sigma,
-            );
+        a.significant = args.tolerate_noise.map_or_else(
+            || a.p.is_some_and(|p| p < args.alpha),
+            |sigma| effect_range(&model.terms[t], data) > sigma,
+        );
     }
     let active = |s: &ColumnSource| !matches!(s,ColumnSource::Term{term} if anova[*term].pooled);
     let x = subset(&mm, active);
@@ -609,6 +595,12 @@ fn analyze_result(
                     term: t.term.label(&design.factors),
                     df: t.df,
                     estimable: t.estimable,
+                    lost: !t.estimable
+                        && design.estimability.as_ref().is_some_and(|e| {
+                            e.terms
+                                .iter()
+                                .any(|prior| prior.term == t.term && prior.estimable)
+                        }),
                     aliased_with: t.aliased_with,
                 })
                 .collect(),
@@ -652,6 +644,63 @@ fn percentile(values: &mut [f64], alpha: f64) -> (Option<f64>, Option<f64>) {
         Some(quantile(1.0 - alpha / 2.0)),
     )
 }
+
+fn resampled_matrix(
+    x: &[Vec<f64>],
+    groups: &[Vec<usize>],
+    draws: &[usize],
+    original_block_columns: usize,
+) -> Vec<Vec<f64>> {
+    let sampled_block_columns = draws.len().saturating_sub(1);
+    let mut sampled = Vec::new();
+    for (level, &group) in draws.iter().enumerate() {
+        for &index in &groups[group] {
+            let mut row =
+                Vec::with_capacity(x[index].len() - original_block_columns + sampled_block_columns);
+            row.push(x[index][0]);
+            for column in 0..sampled_block_columns {
+                row.push(if level == draws.len() - 1 {
+                    -1.0
+                } else if level == column {
+                    1.0
+                } else {
+                    0.0
+                });
+            }
+            row.extend_from_slice(&x[index][original_block_columns + 1..]);
+            sampled.push(row);
+        }
+    }
+    sampled
+}
+
+fn resampled_prediction_row(
+    row: &[f64],
+    original_block_columns: usize,
+    sampled_block_columns: usize,
+) -> Vec<f64> {
+    let mut sampled =
+        Vec::with_capacity(row.len() - original_block_columns + sampled_block_columns);
+    sampled.push(row[0]);
+    sampled.extend(std::iter::repeat_n(0.0, sampled_block_columns));
+    sampled.extend_from_slice(&row[original_block_columns + 1..]);
+    sampled
+}
+
+fn resampled_column_index(
+    column: usize,
+    original_block_columns: usize,
+    sampled_block_columns: usize,
+) -> Option<usize> {
+    if column == 0 {
+        Some(0)
+    } else if column > original_block_columns {
+        Some(column - original_block_columns + sampled_block_columns)
+    } else {
+        (column <= sampled_block_columns).then_some(column)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn bootstrap(
     x: &[Vec<f64>],
@@ -693,31 +742,31 @@ fn bootstrap(
     let mut rng = Rng::new(args.seed.or(design.randomization_seed).unwrap_or(0));
     let mut cs = vec![Vec::new(); coefficients.len()];
     let mut ps = vec![Vec::new(); rows.len()];
+    let original_block_columns = design.replicates[0].levels.len().saturating_sub(1);
     for _ in 0..b {
         let draws: Vec<_> = (0..groups.len())
             .map(|_| rng.below(groups.len() as u64) as usize)
             .collect();
-        let indices: Vec<_> = draws
+        let sampled_block_columns = draws.len().saturating_sub(1);
+        let bx = resampled_matrix(x, &groups, &draws, original_block_columns);
+        let by: Vec<_> = draws
             .iter()
-            .flat_map(|&g| groups[g].iter().copied())
+            .flat_map(|&group| groups[group].iter().map(|&index| y[index]))
             .collect();
-        let mut bx: Vec<_> = indices.iter().map(|&i| x[i].clone()).collect();
-        // Center the sampled seed blocks at the mean of the sampled groups.
-        for j in 1..design.replicates[0].levels.len() {
-            let center =
-                draws.iter().map(|&g| x[groups[g][0]][j]).sum::<f64>() / draws.len() as f64;
-            for row in &mut bx {
-                row[j] -= center;
-            }
-        }
-        let by: Vec<_> = indices.iter().map(|&i| y[i]).collect();
+        let brows: Vec<_> = rows
+            .iter()
+            .map(|row| resampled_prediction_row(row, original_block_columns, sampled_block_columns))
+            .collect();
         let fit = model::fit_least_squares(&bx, &by);
         for (j, samples) in cs.iter_mut().enumerate() {
-            if fit.estimable_coef[j] {
-                samples.push(fit.coef[j]);
+            match resampled_column_index(j, original_block_columns, sampled_block_columns) {
+                Some(sampled_j) if fit.estimable_coef[sampled_j] => {
+                    samples.push(fit.coef[sampled_j]);
+                }
+                _ => {}
             }
         }
-        for (row, samples) in rows.iter().zip(&mut ps) {
+        for (row, samples) in brows.iter().zip(&mut ps) {
             if model::is_estimable(&bx, row) {
                 samples.push(dot(row, &fit.coef));
             }
@@ -756,11 +805,12 @@ fn render_result(r: &ResultReport, alpha: f64) -> String {
     for t in &r.estimability.terms {
         writeln!(
             out,
-            "  {}  {}  {}  {}",
+            "  {}  {}  {}  {}{}",
             t.term,
             t.df,
             if t.estimable { "yes" } else { "no" },
-            t.aliased_with.join(", ")
+            t.aliased_with.join(", "),
+            if t.lost { " LOST (missing runs)" } else { "" }
         )
         .unwrap();
     }
@@ -929,12 +979,49 @@ mod tests {
         data.pop();
         let r = analyze_result(&d, "y", &data, vec!["r0004".into()], &args()).unwrap();
         assert!(!r.estimability.terms[2].estimable);
+        assert!(r.estimability.terms[2].lost);
         let text = render_result(&r, 0.05);
         assert!(text.contains("Missing runs (1): r0004"));
-        assert!(text.contains("a:b: LOST (missing runs)"));
+        assert!(text
+            .lines()
+            .any(|line| line.contains("a:b") && line.contains("LOST (missing runs)")));
         assert!(text.contains("n/e"));
         assert_eq!(r.predictions.iter().filter(|p| p.measured).count(), 3);
         assert!(!r.predictions[3].estimable);
+    }
+
+    #[test]
+    fn significant_estimable_part_recommends_for_partially_observed_factor() {
+        let mut d = design(&["f"], "y ~ f");
+        d.factors = vec![Factor::parse("f", r#"d["lo","mid","hi"]"#).unwrap()];
+        let data = (0..4)
+            .flat_map(|_| {
+                [
+                    (
+                        Cell {
+                            factor_levels: vec![0],
+                            replicate_levels: vec![],
+                        },
+                        0.0,
+                    ),
+                    (
+                        Cell {
+                            factor_levels: vec![1],
+                            replicate_levels: vec![],
+                        },
+                        10.0,
+                    ),
+                ]
+            })
+            .collect::<Vec<_>>();
+
+        let r = fit(&d, &data, &args());
+
+        assert!(!r.estimability.terms[0].estimable);
+        assert_eq!(r.anova[0].p, Some(0.0));
+        assert!(r.anova[0].significant);
+        assert!(has_evidence(&r)); // This result therefore takes the CLI's exit-0 path.
+        assert!(render_result(&r, 0.05).contains("MAXIMIZE"));
     }
     #[test]
     fn split_plot_denominators_are_nested_fit_mean_squares() {
@@ -1029,6 +1116,25 @@ mod tests {
         let p = &first.predictions[0];
         assert!(p.boot_low.unwrap() < 16.0 && p.boot_high.unwrap() > 16.0);
         assert!(first.warnings.is_empty());
+    }
+
+    #[test]
+    fn bootstrap_relabels_duplicate_draws_as_distinct_blocks() {
+        let x = vec![
+            vec![1.0, 1.0, 0.0, 2.0],
+            vec![1.0, 0.0, 1.0, 3.0],
+            vec![1.0, -1.0, -1.0, 4.0],
+        ];
+        let groups = vec![vec![0], vec![1], vec![2]];
+        let draws = vec![0, 0, 1];
+        let original_block_columns = 2;
+
+        let sampled = resampled_matrix(&x, &groups, &draws, original_block_columns);
+        let sampled_block_columns = sampled[0].len() - (x[0].len() - original_block_columns);
+
+        assert_eq!(sampled_block_columns, draws.len() - 1);
+        assert_eq!(&sampled[0][1..3], &[1.0, 0.0]);
+        assert_eq!(&sampled[1][1..3], &[0.0, 1.0]);
     }
     #[test]
     fn type_two_omits_containing_terms_and_reports_blocks() {

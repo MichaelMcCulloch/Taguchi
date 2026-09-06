@@ -35,6 +35,7 @@ pub struct TermReport {
     pub term: String,
     pub df: usize,
     pub estimable: bool,
+    pub lost: bool,
     pub aliased_with: Vec<String>,
 }
 #[derive(Debug, Serialize, Deserialize)]
