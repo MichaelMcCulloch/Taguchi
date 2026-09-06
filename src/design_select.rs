@@ -344,32 +344,30 @@ pub fn select(
     let replicates: usize = roles.iter().map(|r| r.levels.len()).product();
     let base = build_array(factors)?;
 
-    // With no formula the design is whatever v1 built: the model was not
-    // requested, so there is nothing to refuse. The report still prints.
+    // With no formula the design is whatever v1 built, so long as the user's
+    // own limits allow it: no term was requested, so none has to be estimable.
+    // When `--max-runs` or `--min-residual-df` rules that array out, the search
+    // below runs on the default main-effects model instead of writing a design
+    // the user said they did not want.
     if models.is_empty() {
         let cells = build_cells(&base, factors, roles);
         let mm = model_matrix(factors, roles, &model, &cells, None);
         let est = estimability(&mm, &model, factors);
         let runs = cells.len();
-        if let Some(max) = opts.max_runs
-            && runs > max
-        {
+        let within_limits =
+            opts.max_runs.is_none_or(|max| runs <= max) && est.residual_df >= opts.min_residual_df;
+        if within_limits {
             let report = render(factors, models, &model, &base.info.label, roles, &est, runs);
-            return Err(Refusal(format!(
-                "{report}\nrefused: {runs} runs exceeds --max-runs {max}"
-            ))
-            .into());
+            return Ok(Selection {
+                label: base.info.label.clone(),
+                selected: base,
+                cells,
+                estimability: est,
+                model,
+                report,
+                aliased: false,
+            });
         }
-        let report = render(factors, models, &model, &base.info.label, roles, &est, runs);
-        return Ok(Selection {
-            label: base.info.label.clone(),
-            selected: base,
-            cells,
-            estimability: est,
-            model,
-            report,
-            aliased: false,
-        });
     }
 
     // Candidates: (a) today's array, (b) catalog entries, (c) deeper Bush
@@ -481,7 +479,11 @@ pub fn select(
         .filter(|t| !t.estimable)
         .map(|t| t.term.label(factors))
         .collect();
-    let reason = if unmet.is_empty() {
+    // `--max-runs` is the user's hard budget: no flag waives it.
+    let over_max = opts.max_runs.filter(|&max| runs > max);
+    let reason = if let Some(max) = over_max {
+        format!("the smallest candidate is {runs} runs, above --max-runs {max}")
+    } else if unmet.is_empty() {
         format!(
             "no candidate design reaches residual df {} within the limits",
             opts.min_residual_df
@@ -492,7 +494,7 @@ pub fn select(
             unmet.join(", ")
         )
     };
-    if opts.allow_aliased {
+    if opts.allow_aliased && over_max.is_none() {
         report.push_str(&format!("warning: {reason}; --allow-aliased kept it\n"));
         return Ok(Selection {
             label: selected.info.label.clone(),
@@ -504,11 +506,13 @@ pub fn select(
             aliased: true,
         });
     }
-    Err(Refusal(format!(
-        "{report}refused: {reason}. Raise --max-runs, add --replicate, relax \
-         --min-residual-df, or pass --allow-aliased to write it anyway."
-    ))
-    .into())
+    let advice = if over_max.is_some() {
+        "Raise --max-runs, or ask for a model the budget can carry."
+    } else {
+        "Raise --max-runs, add --replicate, relax --min-residual-df, or pass \
+         --allow-aliased to write it anyway."
+    };
+    Err(Refusal(format!("{report}refused: {reason}. {advice}")).into())
 }
 
 /// The construct-time report of spec §"Design selection with a model", step 4.
@@ -722,6 +726,78 @@ mod tests {
         assert_eq!(s.cells.len(), 4);
         assert!(s.estimability.terms.iter().any(|t| !t.estimable));
         assert!(s.report.contains("--allow-aliased kept it"), "{}", s.report);
+    }
+
+    /// The user's limits bind with no formula too: `--min-residual-df` and
+    /// `--max-runs` apply to the default main-effects model, and the search
+    /// takes over when the v1 array misses them.
+    #[test]
+    fn limits_bind_without_a_formula() {
+        let fs = factors(&["d[1,2]", "d[1,2]"]);
+        // The v1 default is 4 rows with 3 parameters, so residual df is 1.
+        let plain = select(&fs, &[], &[], None, &SelectOpts::default()).unwrap();
+        assert_eq!(plain.cells.len(), 4);
+        assert_eq!(plain.estimability.residual_df, 1);
+
+        // Two residual df is out of reach up to the 4-run full factorial.
+        let strict = SelectOpts {
+            min_residual_df: 2,
+            ..SelectOpts::default()
+        };
+        let err = select(&fs, &[], &[], None, &strict).unwrap_err();
+        let refusal = err.downcast_ref::<Refusal>().expect("refusal");
+        assert!(refusal.0.contains("residual df 2"), "{}", refusal.0);
+
+        // Replicates supply the rows, so the same request now succeeds.
+        let s = select(&fs, &[], &[seed_role(2)], None, &strict).unwrap();
+        assert_eq!(s.cells.len(), 8);
+        assert!(s.estimability.residual_df >= 2);
+
+        // --max-runs still refuses when no candidate fits under it.
+        let err = select(
+            &fs,
+            &[],
+            &[],
+            None,
+            &SelectOpts {
+                max_runs: Some(2),
+                ..SelectOpts::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.downcast_ref::<Refusal>()
+                .is_some_and(|r| r.0.contains("--max-runs 2")),
+            "{err:#}"
+        );
+    }
+
+    /// `--allow-aliased` waives estimability only. The run budget is absolute.
+    #[test]
+    fn allow_aliased_does_not_waive_max_runs() {
+        let opts = SelectOpts {
+            max_runs: Some(2),
+            allow_aliased: true,
+            ..SelectOpts::default()
+        };
+        let err = run(&["d[1,2]", "d[1,2]"], "a*b", &[], &opts).unwrap_err();
+        let refusal = err.downcast_ref::<Refusal>().expect("refusal");
+        assert!(refusal.0.contains("--max-runs 2"), "{}", refusal.0);
+        assert!(refusal.0.contains("refused:"), "{}", refusal.0);
+        // The same request without the cap is written, aliased.
+        let s = run(
+            &["d[1,2]", "d[1,2]"],
+            "a*b",
+            &[],
+            &SelectOpts {
+                min_residual_df: 1,
+                allow_aliased: true,
+                ..SelectOpts::default()
+            },
+        )
+        .unwrap();
+        assert!(s.aliased);
+        assert_eq!(s.cells.len(), 4);
     }
 
     /// With no formula the search does not run: the design is whatever
