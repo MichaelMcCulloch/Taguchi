@@ -56,6 +56,21 @@ enum Cmd {
         /// Significance level when --tolerate-noise is not used.
         #[arg(long, default_value_t = 0.05)]
         alpha: f64,
+        /// Pool the named model terms into their error strata and refit.
+        #[arg(long, value_delimiter = ',')]
+        pool: Vec<String>,
+        /// Pool the smallest-SS half of terms in strata with zero residual df.
+        #[arg(long)]
+        pool_auto: bool,
+        /// Whole-group bootstrap samples (default: 1000 with replicates, otherwise 0).
+        #[arg(long)]
+        bootstrap: Option<usize>,
+        /// Bootstrap RNG seed (defaults to the design seed, or 0 for legacy designs).
+        #[arg(long)]
+        seed: Option<u64>,
+        /// Write the version-2 analysis report as JSON.
+        #[arg(long)]
+        json: Option<PathBuf>,
     },
 }
 
@@ -73,6 +88,11 @@ fn main() -> Result<()> {
             minimize,
             tolerate_noise,
             alpha,
+            pool,
+            pool_auto,
+            bootstrap,
+            seed,
+            json,
         } => analyze::run_analyze(analyze::AnalyzeArgs {
             csv_path: csv,
             design_path: design,
@@ -80,6 +100,11 @@ fn main() -> Result<()> {
             minimize,
             tolerate_noise,
             alpha,
+            pool,
+            pool_auto,
+            bootstrap,
+            seed,
+            json,
         }),
     }
 }
