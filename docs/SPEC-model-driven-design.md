@@ -470,3 +470,5 @@ owns here. Leave those alone; the gate is scoped to owned files.
 ## Deviations
 
 (append here; one line each: date, who, what, why)
+
+- 2026-09-05, Phase 1: Retain the specified deviation coding; test orthogonality between distinct terms, not within multi-column terms, because the item’s mutually-orthogonal 2×3-column requirement contradicts that coding (the two b columns have dot product 2).
