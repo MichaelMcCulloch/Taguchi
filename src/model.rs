@@ -99,6 +99,9 @@ fn valid_name(s: &str) -> bool {
 }
 
 pub(crate) fn formula_names(expr: &str) -> Result<Vec<String>> {
+    if expr.contains("%in%") {
+        bail!("unsupported formula syntax '%in%'");
+    }
     Ok(tokenize(expr.split_once('~').map_or(expr, |(_, rhs)| rhs))?
         .into_iter()
         .filter(|s| valid_name(s))
@@ -450,6 +453,40 @@ pub fn estimability(mm: &ModelMatrix, model: &Model, factors: &[Factor]) -> Esti
             .checked_sub(decompose(&reduced, p - indices.len()).rank)
             == Some(indices.len())
     };
+    let null_basis = pivoted_null_basis(&mm.data, p, d.tolerance);
+    let column_sources: Vec<_> = mm.columns.iter().map(alias_source).collect();
+    let source_labels: Vec<_> = mm
+        .columns
+        .iter()
+        .map(|column| alias_source_label(column, model, factors))
+        .collect();
+    let mut aliases = vec![Vec::new(); model.terms.len()];
+    for null_vector in null_basis {
+        let mut sources = Vec::new();
+        for (column, &coefficient) in null_vector.iter().enumerate() {
+            if coefficient.abs() > 1e-8 && !sources.contains(&column_sources[column]) {
+                sources.push(column_sources[column]);
+            }
+        }
+        for &source in &sources {
+            let AliasSource::Term { term } = source else {
+                continue;
+            };
+            for &other in &sources {
+                if other == source {
+                    continue;
+                }
+                let label = &source_labels[mm
+                    .columns
+                    .iter()
+                    .position(|column| alias_source(column) == other)
+                    .expect("every alias source has a column")];
+                if !aliases[term].contains(label) {
+                    aliases[term].push(label.clone());
+                }
+            }
+        }
+    }
     let mut terms = Vec::new();
     for (t, term) in model.terms.iter().enumerate() {
         let indices: Vec<_> = mm
@@ -460,32 +497,15 @@ pub fn estimability(mm: &ModelMatrix, model: &Model, factors: &[Factor]) -> Esti
             .map(|(j, _)| j)
             .collect();
         let estimable = independent(&indices);
-        let mut aliases = vec![false; model.terms.len()];
-        if !estimable {
-            for k in d.rank..p {
-                if indices.iter().any(|&j| d.vt[(k, j)].abs() > 1e-8) {
-                    for (j, col) in mm.columns.iter().enumerate() {
-                        if let ColumnSource::Term { term: other } = col.source
-                            && other != t
-                            && d.vt[(k, j)].abs() > 1e-8
-                        {
-                            aliases[other] = true;
-                        }
-                    }
-                }
-            }
-        }
         terms.push(TermEstimability {
             term: term.clone(),
             df: indices.len(),
             estimable,
-            aliased_with: model
-                .terms
-                .iter()
-                .zip(aliases)
-                .filter(|(_, alias)| *alias)
-                .map(|(term, _)| term.label(factors))
-                .collect(),
+            aliased_with: if !estimable {
+                aliases[t].clone()
+            } else {
+                Vec::new()
+            },
         });
     }
     let blocks: Vec<_> = mm
@@ -505,6 +525,89 @@ pub fn estimability(mm: &ModelMatrix, model: &Model, factors: &[Factor]) -> Esti
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AliasSource {
+    Intercept,
+    Block { role: usize },
+    Term { term: usize },
+    Unit,
+}
+
+fn alias_source(column: &ColumnInfo) -> AliasSource {
+    match column.source {
+        ColumnSource::Intercept => AliasSource::Intercept,
+        ColumnSource::Block { role } => AliasSource::Block { role },
+        ColumnSource::Term { term } => AliasSource::Term { term },
+        ColumnSource::Unit => AliasSource::Unit,
+    }
+}
+
+fn alias_source_label(column: &ColumnInfo, model: &Model, factors: &[Factor]) -> String {
+    match column.source {
+        ColumnSource::Intercept => "(Intercept)".into(),
+        ColumnSource::Block { .. } => column
+            .label
+            .split_once('[')
+            .map_or_else(|| column.label.clone(), |(role, _)| role.into()),
+        ColumnSource::Term { term } => model.terms[term].label(factors),
+        ColumnSource::Unit => "unit".into(),
+    }
+}
+
+/// RREF supplies one null vector per non-pivot column, avoiding mixed SVD bases.
+fn pivoted_null_basis(x: &[Vec<f64>], p: usize, tolerance: f64) -> Vec<Vec<f64>> {
+    let mut rref = x.to_vec();
+    let mut pivot_columns = Vec::new();
+    let mut pivot_row = 0;
+    for column in 0..p {
+        let Some((row, magnitude)) = (pivot_row..rref.len())
+            .map(|row| (row, rref[row][column].abs()))
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+        else {
+            break;
+        };
+        if magnitude <= tolerance {
+            continue;
+        }
+        rref.swap(pivot_row, row);
+        let pivot = rref[pivot_row][column];
+        for value in &mut rref[pivot_row][column..] {
+            *value /= pivot;
+        }
+        let pivot_values = rref[pivot_row][column + 1..].to_vec();
+        for (row, rref_row) in rref.iter_mut().enumerate() {
+            if row == pivot_row {
+                continue;
+            }
+            let scale = rref_row[column];
+            rref_row[column] = 0.0;
+            for (entry, pivot_value) in rref_row[column + 1..].iter_mut().zip(&pivot_values) {
+                *entry -= scale * pivot_value;
+            }
+        }
+        pivot_columns.push(column);
+        pivot_row += 1;
+        if pivot_row == rref.len() {
+            break;
+        }
+    }
+    let mut pivots = vec![false; p];
+    for &column in &pivot_columns {
+        pivots[column] = true;
+    }
+    (0..p)
+        .filter(|&column| !pivots[column])
+        .map(|free_column| {
+            let mut vector = vec![0.0; p];
+            vector[free_column] = 1.0;
+            for (row, &pivot_column) in pivot_columns.iter().enumerate() {
+                vector[pivot_column] = -rref[row][free_column];
+            }
+            vector
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 pub struct Fit {
     pub coef: Vec<f64>,
@@ -517,8 +620,8 @@ pub struct Fit {
     pub cov_unscaled: Option<Vec<Vec<f64>>>,
 }
 
-fn in_row_space(d: &Decomposition, v: &[f64]) -> bool {
-    let null_norm = (d.rank..v.len())
+fn row_space_residual_norm(d: &Decomposition, v: &[f64], rank: usize) -> f64 {
+    (rank..v.len())
         .map(|k| {
             v.iter()
                 .enumerate()
@@ -527,8 +630,22 @@ fn in_row_space(d: &Decomposition, v: &[f64]) -> bool {
                 .powi(2)
         })
         .sum::<f64>()
-        .sqrt();
-    null_norm <= d.tolerance
+        .sqrt()
+}
+
+fn in_numerical_row_space(d: &Decomposition, v: &[f64]) -> bool {
+    row_space_residual_norm(d, v, d.rank) <= 1e-8 * v_norm(v).max(1.0)
+}
+
+fn projector_rank(d: &Decomposition) -> usize {
+    let tolerance = f64::EPSILON
+        * d.singular.iter().copied().fold(0.0, f64::max)
+        * d.u.nrows().max(d.vt.ncols()) as f64;
+    d.singular.iter().filter(|&&s| s > tolerance).count()
+}
+
+fn v_norm(v: &[f64]) -> f64 {
+    v.iter().map(|value| value * value).sum::<f64>().sqrt()
 }
 
 pub fn fit_least_squares(x: &[Vec<f64>], y: &[f64]) -> Fit {
@@ -565,7 +682,7 @@ pub fn fit_least_squares(x: &[Vec<f64>], y: &[f64]) -> Fit {
         .map(|j| {
             let mut e = vec![0.0; p];
             e[j] = 1.0;
-            in_row_space(&d, &e)
+            in_numerical_row_space(&d, &e)
         })
         .collect();
     Fit {
@@ -581,11 +698,14 @@ pub fn fit_least_squares(x: &[Vec<f64>], y: &[f64]) -> Fit {
 }
 
 pub fn is_estimable(x: &[Vec<f64>], v: &[f64]) -> bool {
-    assert!(
-        v.iter().all(|v| v.is_finite()),
-        "expected a finite contrast"
-    );
-    in_row_space(&decompose(x, v.len()), v)
+    if !v.iter().all(|value| value.is_finite())
+        || x.iter()
+            .any(|row| row.len() != v.len() || row.iter().any(|value| !value.is_finite()))
+    {
+        return false;
+    }
+    let d = decompose(x, v.len());
+    row_space_residual_norm(&d, v, projector_rank(&d)) <= 1e-8 * v_norm(v).max(1.0)
 }
 
 #[cfg(test)]
@@ -811,7 +931,19 @@ mod tests {
         assert_eq!(e.terms[3].df, 1);
         assert_eq!(e.terms[3].aliased_with, ["c"]);
         assert_eq!(e.terms[2].aliased_with, ["a:b"]);
+        let m = Model::parse("a+b+c+a:b+a:c+b:c", &fs).unwrap();
+        let aliases = estimability(&model_matrix(&fs, &[], &m, &cells, None), &m, &fs);
+        assert_eq!(aliases.terms[0].aliased_with, ["b:c"]);
+        assert_eq!(aliases.terms[1].aliased_with, ["a:c"]);
+        assert_eq!(aliases.terms[2].aliased_with, ["a:b"]);
+        assert_eq!(aliases.terms[3].aliased_with, ["c"]);
+        assert_eq!(aliases.terms[4].aliased_with, ["b"]);
+        assert_eq!(aliases.terms[5].aliased_with, ["a"]);
         let m = Model::parse("a*b*c", &fs).unwrap();
+        assert_eq!(
+            estimability(&model_matrix(&fs, &[], &m, &cells, None), &m, &fs).terms[6].aliased_with,
+            ["(Intercept)"]
+        );
         let mut cells = grid(&[2, 2, 2]);
         let full = estimability(&model_matrix(&fs, &[], &m, &cells, None), &m, &fs);
         assert_eq!((full.rank, full.residual_df), (8, 0));
@@ -835,6 +967,45 @@ mod tests {
         assert_eq!((replicated.rank, replicated.residual_df), (9, 7));
         assert!(replicated.blocks_estimable);
         assert!(replicated.terms.iter().all(|t| t.estimable));
+    }
+
+    #[test]
+    fn aliases_name_block_sources() {
+        let fs = factors(&[2]);
+        let model = Model::main_effects(&fs);
+        let roles = vec![ReplicateRole {
+            name: "seed".into(),
+            levels: vec![FactorValue::Int(1), FactorValue::Int(2)],
+        }];
+        let cells = vec![
+            Cell {
+                factor_levels: vec![0],
+                replicate_levels: vec![0],
+            },
+            Cell {
+                factor_levels: vec![1],
+                replicate_levels: vec![1],
+            },
+        ];
+        let report = estimability(
+            &model_matrix(&fs, &roles, &model, &cells, None),
+            &model,
+            &fs,
+        );
+        assert!(!report.terms[0].estimable);
+        assert_eq!(report.terms[0].aliased_with, ["seed"]);
+
+        let unit = Unit {
+            name: "checkpoint".into(),
+            key: vec!["a".into()],
+        };
+        let report = estimability(
+            &model_matrix(&fs, &[], &model, &cells, Some(&unit)),
+            &model,
+            &fs,
+        );
+        assert!(!report.terms[0].estimable);
+        assert_eq!(report.terms[0].aliased_with, ["unit"]);
     }
 
     #[test]
@@ -915,7 +1086,12 @@ mod tests {
         }
         let near_null = vec![vec![1., 0.], vec![0., 1e-11]];
         assert!(is_estimable(&near_null, &near_null[1]));
-        assert!(!is_estimable(&near_null, &[0., 1.]));
+        assert!(is_estimable(&near_null, &[0., 1.]));
+        let scaled = vec![vec![1e9, 0.], vec![0., 0.1]];
+        assert!(is_estimable(&scaled, &[0.9, 0.1]));
+        assert!(!is_estimable(&scaled, &[0., 0., 0.]));
+        let rank_one = vec![vec![1., 1.], vec![2., 2.]];
+        assert!(!is_estimable(&rank_one, &[1., -1.]));
         let zero = vec![vec![0., 0.]; 3];
         let fit = fit_least_squares(&zero, &[1., 2., 3.]);
         assert_eq!((fit.rank, fit.residual_df), (0, 3));

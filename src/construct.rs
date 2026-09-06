@@ -551,6 +551,7 @@ mod tests {
             ),
             ("[model]\nz ~ a\n", 7, "unknown result name 'z'"),
             ("[model]\na -1\n", 7, "unsupported"),
+            ("[model]\na %in% b\n", 7, "%in%"),
             ("[replicates]\nseed = 0\n", 7, "positive"),
             ("[replicates]\nseed = bad\n", 7, "invalid replicate count"),
             ("[replicates]\na = 2\n", 7, "duplicate"),
