@@ -1,0 +1,70 @@
+# GitLab CI for the taguchi crate.
+#
+# taguchi is a CLI crate, not a service: there is no container image to build
+# and no deploy branch to write back to. The pipeline only proves that the
+# thing compiles, stays formatted, and that its tests — including the
+# end-to-end tests in tests/cli.rs that drive the built binary — pass.
+#
+# The gate is the branch, not a merge request: every push to any branch runs
+# the same two stages.
+
+# 1.96 is the toolchain the crate is developed against. rustfmt output is
+# version-dependent, so the check stage below only proves anything if CI runs
+# the same rustfmt the developers run. Raise both together.
+image: rust:1.96
+
+stages:
+  - check
+  - test
+
+variables:
+  # .cargo/config.toml sets -C target-cpu=native, which is right on a
+  # developer's own machine and wrong on a shared runner. An empty RUSTFLAGS
+  # overrides the file and gives a portable build.
+  RUSTFLAGS: ""
+  # Keep the registry inside the project dir so the cache below can hold it.
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo-home"
+  CARGO_TERM_COLOR: "always"
+
+# Keyed on Cargo.lock: a dependency change starts a fresh cache, and every
+# pipeline that resolves to the same lock file reuses one.
+cache:
+  key:
+    files:
+      - Cargo.lock
+  paths:
+    - .cargo-home/registry/index/
+    - .cargo-home/registry/cache/
+    - .cargo-home/git/db/
+    - target/
+
+# Formatting is checked file by file, not with `cargo fmt --check`. Most of
+# the pre-v2 tree carries format drift that predates this pipeline; the list
+# below is every file that is clean today. Add a file here when you format it;
+# do not remove one.
+fmt:
+  stage: check
+  rules:
+    - if: $CI_COMMIT_BRANCH
+  script:
+    - rustup component add rustfmt
+    - >
+      rustfmt --edition 2024 --check
+      src/analyze.rs
+      src/augment.rs
+      src/construct.rs
+      src/design_select.rs
+      src/main.rs
+      src/model.rs
+      src/oa/kronecker.rs
+      src/report.rs
+      src/rng.rs
+      tests/cli.rs
+
+test:
+  stage: test
+  rules:
+    - if: $CI_COMMIT_BRANCH
+  script:
+    - cargo build --all-targets --locked
+    - cargo test --locked
