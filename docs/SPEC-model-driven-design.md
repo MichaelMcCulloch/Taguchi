@@ -472,3 +472,5 @@ owns here. Leave those alone; the gate is scoped to owned files.
 (append here; one line each: date, who, what, why)
 
 - 2026-09-05, Phase 1: Retain the specified deviation coding; test orthogonality between distinct terms, not within multi-column terms, because the item’s mutually-orthogonal 2×3-column requirement contradicts that coding (the two b columns have dot product 2).
+- 2026-09-05, W2: Candidate enumeration steps 1b and 1c stop at the full factorial's row count. Nothing larger than a full factorial can ever be the smallest suitable design, and without the bound a catalog entry above it would satisfy `--min-residual-df` where the spec's own example ("2 two-level factors, `a*b`, `--min-residual-df 1`") calls for exit 3.
+- 2026-09-05, W2: Manifest unit ids are `u0001`… (four digits), per the W2 item text; the `Run.unit` field comment in this document shows `"u007"` as an example. `model.rs` labels its unit columns `unit[u001]` and is unchanged.
