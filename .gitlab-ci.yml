@@ -22,6 +22,9 @@ variables:
   # developer's own machine and wrong on a shared runner. An empty RUSTFLAGS
   # overrides the file and gives a portable build.
   RUSTFLAGS: ""
+  # The runner environment sets RUSTC_WRAPPER=sccache, and the rust image has
+  # no sccache binary. An empty value here overrides it: plain rustc.
+  RUSTC_WRAPPER: ""
   # Keep the registry inside the project dir so the cache below can hold it.
   CARGO_HOME: "$CI_PROJECT_DIR/.cargo-home"
   CARGO_TERM_COLOR: "always"
