@@ -2,6 +2,14 @@
 
 Notes for hacking on this crate.
 
+## The spec is the contract
+
+`docs/SPEC-model-driven-design.md` is the contract for the model-driven design
+work: the formula grammar, the design-file sections, the CLI surface, the exit
+codes, the JSON shapes and the numeric tolerances. When the code and that
+document disagree, the document wins. Change the document first, in its
+`## Deviations` section, and say why.
+
 ## Source layout
 
 ```
@@ -9,8 +17,13 @@ src/
   main.rs           — clap entrypoint (thin shim)
   lib.rs            — re-exports the modules
   factor.rs         — Factor parsing (d[…], uniform[…], normal[…], logLow/High[…])
-  construct.rs      — interactive + file-driven design construction, CSV writer
-  analyze.rs        — ANOVA decomposition, F-tests, noise-floor handling, recommendation
+  model.rs          — formula parsing, sum-to-zero model matrix, estimability, least squares
+  rng.rs            — splitmix64 + Fisher–Yates; every shuffle and resample goes through it
+  design_select.rs  — candidate enumeration, the model-driven pick, the construct-time report
+  construct.rs      — design-file parsing, the Design manifest, the v2 CSV writer
+  analyze.rs        — rank-aware fit, Type II ANOVA, strata, bootstrap, predictions
+  report.rs         — the serde types behind `analyze --json`
+  augment.rs        — greedy rank-then-D-gain augmentation of an existing design
   oa/
     mod.rs          — Method enum, Selected struct, build_array dispatch, verify_strength2
     lookup.rs       — Tier 1: Sloane catalog (embedded via include_dir)
@@ -18,10 +31,76 @@ src/
     bush.rs         — Tier 2: Bush construction (scalar + SSSE3 + AVX2 paths)
     kronecker.rs    — Tier 3: row-tensor combine of per-level Bush blocks
     backtrack.rs    — Tier 4: DFS column extension with pair-balance pruning
+tests/
+  cli.rs            — end-to-end tests that spawn the built binary and read what it writes
 benches/
   oa.rs             — criterion benchmarks for each tier
 data/sloane_arrays/ — 280 .txt files from neilsloane.com/oadir/, baked in at compile time
 ```
+
+## Statistical core
+
+Five ideas carry the whole v2 analysis. Each one lives behind a single
+function, and both `construct` and `analyze` call that same function rather
+than each keeping its own copy of the rule. Keep it that way: an estimability
+rule implemented twice is an estimability rule that disagrees with itself.
+
+**Sum-to-zero coding.** `model::model_matrix` turns level indices into a
+design matrix. A factor with `L` levels gets `L-1` columns: column `j` holds
+1 at level `j`, −1 at the last level, and 0 elsewhere. An interaction column
+is the element-wise product of one column from each participating factor, over
+all combinations. The intercept comes first, then one block column set per
+replicate role, then the model terms in order, then — only when the caller
+asks — one column set for the unit identity. The coding makes every factor's
+effects sum to zero across its levels, so the intercept is the grand mean of a
+balanced design and a prediction with the block columns at zero is a prediction
+"at the average seed". Labels are `(Intercept)`, `seed[3]`, `a[x]`, `a[x]:b[y]`, `unit[u001]`.
+
+**Estimability by rank difference.** `model::estimability` asks, for each term
+T: does dropping T's columns cost the matrix exactly `df(T)` of rank? If yes,
+T is estimable; the data can separate it from everything else in the model. If
+no, T is confounded and the report names what with. Those names come from
+`model::pivoted_null_basis`, a reduced-row-echelon basis of the null space.
+The pivoting matters: an arbitrary SVD basis mixes independent aliases
+together when the null space has more than one dimension, so it would report
+"a:b is aliased with c and d and e" where the truth is "a:b is aliased with
+c". Numerical rank uses a tolerance of `1e-10 × σ_max × max(n_rows, n_cols)`.
+`design_select::select` calls this before writing anything; `analyze` calls it
+again on the rows that actually have data, and flags a term that was estimable
+at design time and is not any more.
+
+**Type II sums of squares by nested fits.** `analyze_result` does not subtract
+marginal factor sums from the total. That shortcut needs an orthogonal design,
+and a single missing result destroys orthogonality. Instead, for each term T
+it fits twice: once with every term that neither equals nor contains T, and
+once with T's columns added. `SS(T)` is the drop in RSS, and `df(T)` is the
+rank gained. Both fits go through `model::fit_least_squares`, a rank-revealing
+least squares that returns the minimum-norm solution when the matrix is
+rank-deficient, so a confounded model still produces a report instead of an
+error.
+
+**Split-plot strata.** When the design file declares a `[units]` key, rows
+that share the key values are one experimental unit — one trained checkpoint,
+say — and measurements inside a unit are paired. A term whose factors all sit
+in the unit key is a *whole-plot* term: it can only change when you build a
+new unit. Any other term is a *sub-plot* term. The two kinds have different
+error. `analyze_result` fits the model a second time with the unit columns
+included: the between-unit mean square is the RSS drop those columns cause on
+top of the whole-plot terms, and the within-unit mean square is what is left
+after everything. Whole-plot terms are tested against the first, sub-plot
+terms against the second. A stratum with zero degrees of freedom reports
+`F: n/a` rather than inventing a denominator.
+
+**Cluster bootstrap.** Coefficient t-intervals assume the model is right.
+`analyze::bootstrap` gives a second opinion that does not. It resamples whole
+replicate groups — every row of one training seed moves together, so the
+pairing inside a unit stays intact — and refits `B` times, then reports
+percentile intervals for every coefficient and every predicted cell. A group
+drawn twice becomes two distinct block levels, so the refit needs no
+re-centring. The default is 1000 resamples when a replicate role exists and
+0 when there is none; below five groups the report warns that the intervals
+are not trustworthy. The RNG is `rng::Rng` seeded from `--seed` or the
+manifest's `randomization_seed`, so a bootstrap is reproducible.
 
 ## The dispatch contract
 
@@ -167,7 +246,8 @@ real inputs. It's there as a correctness safety net.
 ## Testing
 
 ```bash
-cargo test                  # all unit tests (44 currently)
+cargo test                  # everything: 110 unit tests + 8 CLI tests
+cargo test --test cli       # just the end-to-end tests
 cargo test oa::             # just the OA modules
 cargo test oa::bush::       # just Bush
 ```
@@ -182,6 +262,33 @@ Test conventions:
   on which files happen to be embedded.
 - `gf.rs` tests verify the field axioms (identity, commutativity, inverse,
   distributivity) for every implemented prime power.
+- `tests/cli.rs` spawns `env!("CARGO_BIN_EXE_taguchi")` and reads what the
+  process writes: stdout, stderr, the CSV, the sidecar and the exit code.
+  It touches no library function. Each test owns a scratch directory that
+  deletes itself, so the tests run in parallel and leave nothing behind.
+  Pass `--bootstrap 0` to every `analyze` call you add there: the default of
+  1000 resamples costs about 140 s per call in a debug build, and the
+  bootstrap has its own unit tests in `analyze.rs`.
+- The scenario in `tests/cli.rs` is the customer request quoted in the spec,
+  end to end: construct, fill, analyze, blank three cells, augment. Its
+  response function is a known linear model, so the expected ANOVA verdict
+  and the true optimum are facts, not fixtures.
+
+## CI
+
+`.gitlab-ci.yml` runs on every push to any branch — the gate is
+`$CI_COMMIT_BRANCH`, not a merge request. Two stages: `check` runs
+`rustfmt --check` and `test` runs `cargo build --all-targets` then
+`cargo test`. There is no image build and no deploy stage; this is a CLI
+crate.
+
+Two things about that file are load-bearing:
+
+- `RUSTFLAGS: ""` overrides `.cargo/config.toml`'s `-C target-cpu=native`.
+  A shared runner is not the machine that wrote that config.
+- The `fmt` job lists individual files rather than running `cargo fmt --check`.
+  Most of the pre-v2 tree carries format drift that predates the pipeline.
+  When you format a file, add it to that list; never remove one.
 
 ## Benchmarks
 
