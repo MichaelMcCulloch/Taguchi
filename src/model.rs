@@ -634,7 +634,7 @@ fn row_space_residual_norm(d: &Decomposition, v: &[f64], rank: usize) -> f64 {
 }
 
 fn in_numerical_row_space(d: &Decomposition, v: &[f64]) -> bool {
-    row_space_residual_norm(d, v, d.rank) <= 1e-8 * v_norm(v).max(1.0)
+    row_space_residual_norm(d, v, projector_rank(d)) <= 1e-8 * v_norm(v).max(1.0)
 }
 
 fn projector_rank(d: &Decomposition) -> usize {
@@ -698,14 +698,19 @@ pub fn fit_least_squares(x: &[Vec<f64>], y: &[f64]) -> Fit {
 }
 
 pub fn is_estimable(x: &[Vec<f64>], v: &[f64]) -> bool {
+    assert!(
+        x.iter().all(|row| row.len() == v.len()),
+        "contrast length {} does not match matrix width",
+        v.len()
+    );
     if !v.iter().all(|value| value.is_finite())
         || x.iter()
-            .any(|row| row.len() != v.len() || row.iter().any(|value| !value.is_finite()))
+            .any(|row| row.iter().any(|value| !value.is_finite()))
     {
         return false;
     }
     let d = decompose(x, v.len());
-    row_space_residual_norm(&d, v, projector_rank(&d)) <= 1e-8 * v_norm(v).max(1.0)
+    in_numerical_row_space(&d, v)
 }
 
 #[cfg(test)]
@@ -1089,7 +1094,15 @@ mod tests {
         assert!(is_estimable(&near_null, &[0., 1.]));
         let scaled = vec![vec![1e9, 0.], vec![0., 0.1]];
         assert!(is_estimable(&scaled, &[0.9, 0.1]));
-        assert!(!is_estimable(&scaled, &[0., 0., 0.]));
+        assert!(is_estimable(&scaled, &[0., 0.]));
+        for x in [&near_null, &scaled] {
+            let fit = fit_least_squares(x, &[0., 0.]);
+            for j in 0..2 {
+                let mut e = vec![0.; 2];
+                e[j] = 1.;
+                assert_eq!(fit.estimable_coef[j], is_estimable(x, &e), "column {j}");
+            }
+        }
         let rank_one = vec![vec![1., 1.], vec![2., 2.]];
         assert!(!is_estimable(&rank_one, &[1., -1.]));
         let zero = vec![vec![0., 0.]; 3];
