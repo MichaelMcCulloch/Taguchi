@@ -515,7 +515,7 @@ They are `null` when the bootstrap did not run.
 | `--maximize <a,b>` | Result columns to optimize upward. |
 | `--minimize <c>` | Result columns to optimize downward. |
 | `--alpha <A>` | Significance level for the F-tests. Default 0.05. |
-| `--tolerate-noise <SIGMA>` | Instead of the F-test, call a term significant when its effect range across levels exceeds `SIGMA`. |
+| `--tolerate-noise <SIGMA>` | In addition to the F-test, call a term significant when its effect range across levels exceeds `SIGMA`. A term that passes the F-test stays significant. |
 | `--pool <TERM,…>` | Pool the named terms into their error stratum and refit. |
 | `--pool-auto` | Pool the smallest-SS half of the terms, in strata with 0 residual df. |
 | `--bootstrap <B>` | Whole-group bootstrap resamples. Default 1000 with a replicate role, 0 without. |
