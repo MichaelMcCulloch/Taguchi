@@ -374,8 +374,11 @@ Replaces the body of `analyze.rs`. For each result:
 7. Uncertainty. Coefficient SE = sqrt(σ̂² × cov_unscaled[j][j]) for estimable
    columns; t-intervals at 1−α. When `--bootstrap B > 0` and a replicate role
    exists: resample the first replicate role's groups with replacement B
-   times (whole groups; units stay intact inside groups), refit, and report
-   percentile intervals for each coefficient and for each predicted cell mean.
+   times (whole groups; units stay intact inside groups). In each resample
+   every drawn group becomes its own block level (a group drawn twice is two
+   distinct blocks), so the refit uses the same model with no re-centring or
+   other adjustment. Report percentile intervals for each coefficient and for
+   each predicted cell mean.
    RNG is `rng.rs` seeded by `--seed` (analyze gains `--seed U64`, default
    from the design's randomization_seed). Warn when fewer than 5 groups exist.
 8. Predictions: over the full factorial grid of factor levels (block effects
@@ -384,9 +387,11 @@ Replaces the body of `analyze.rs`. For each result:
    recommendation cell. For each cell: predicted mean, SE, `estimable`
    (row-space check), `measured` (appears in complete rows), and the observed
    mean when measured.
-9. Significance gate. A term is significant when its p < α (or, with
-   `--tolerate-noise σ`, when its effect range across levels of the term's
-   cells exceeds σ). If no term is significant for a result, print
+9. Significance gate. A term is significant when its p < α on its estimable
+   part (df = rank gain; a term with 0 estimable df has no p and is not
+   significant). Estimability of the whole term is reported but is not a
+   condition for significance. Or, with `--tolerate-noise σ`, when its
+   effect range across levels of the term's cells exceeds σ. If no term is significant for a result, print
    `insufficient evidence under this model (α=…)` and do not recommend. If
    that holds for every result, exit 2.
 10. Recommendation: the estimable grid cell with the highest (or lowest)
