@@ -297,7 +297,8 @@ fn target_label(src: &str, factors: &[Factor]) -> Result<String> {
 struct Candidates {
     cells: Vec<Cell>,
     /// Set when the full factorial exceeded the cap: (kept, total).
-    sampled: Option<(usize, u128)>,
+    /// The total is absent when its exact value exceeds u128.
+    sampled: Option<(usize, Option<u128>)>,
 }
 
 /// The candidate set: the full factorial of factor levels × replicate levels,
@@ -317,9 +318,14 @@ fn candidate_cells(
         .chain(roles.iter().map(|r| r.levels.len()))
         .collect();
     let n_factors = factors.len();
-    let total: u128 = dims.iter().map(|&d| d as u128).product();
+    let total = if dims.contains(&0) {
+        Some(0)
+    } else {
+        dims.iter()
+            .try_fold(1u128, |n, &d| n.checked_mul(d as u128))
+    };
 
-    if total <= cap as u128 {
+    if total.is_some_and(|n| n <= cap as u128) {
         let mut rows: Vec<Vec<usize>> = vec![Vec::new()];
         for &d in &dims {
             rows = rows
@@ -339,30 +345,31 @@ fn candidate_cells(
         };
     }
 
-    let mut draws: Vec<Vec<usize>> = if total <= 4 * cap as u128 {
-        // Close to the cap, rejection sampling would spend most of its draws
-        // on repeats, so shuffle the enumeration indices instead: a partial
-        // Fisher-Yates picks `cap` of them without replacement in one pass.
-        let mut indices: Vec<u64> = (0..total as u64).collect();
-        for i in 0..cap {
-            let j = i + rng.below((indices.len() - i) as u64) as usize;
-            indices.swap(i, j);
-        }
-        indices.truncate(cap);
-        indices.iter().map(|&i| decode(i, &dims)).collect()
-    } else {
-        // Far above the cap, repeats are rare, so draw coordinates directly
-        // and discard the few collisions.
-        let mut seen = std::collections::HashSet::new();
-        let mut drawn = Vec::with_capacity(cap);
-        while drawn.len() < cap {
-            let draw: Vec<usize> = dims.iter().map(|&d| rng.below(d as u64) as usize).collect();
-            if seen.insert(draw.clone()) {
-                drawn.push(draw);
+    let mut draws: Vec<Vec<usize>> =
+        if let Some(total) = total.filter(|&n| n <= 4 * cap as u128 && n <= u64::MAX as u128) {
+            // Close to the cap, rejection sampling would spend most of its draws
+            // on repeats, so shuffle the enumeration indices instead: a partial
+            // Fisher-Yates picks `cap` of them without replacement in one pass.
+            let mut indices: Vec<u64> = (0..total as u64).collect();
+            for i in 0..cap {
+                let j = i + rng.below((indices.len() - i) as u64) as usize;
+                indices.swap(i, j);
             }
-        }
-        drawn
-    };
+            indices.truncate(cap);
+            indices.iter().map(|&i| decode(i, &dims)).collect()
+        } else {
+            // Far above the cap, repeats are rare, so draw coordinates directly
+            // and discard the few collisions.
+            let mut seen = std::collections::HashSet::new();
+            let mut drawn = Vec::with_capacity(cap);
+            while drawn.len() < cap {
+                let draw: Vec<usize> = dims.iter().map(|&d| rng.below(d as u64) as usize).collect();
+                if seen.insert(draw.clone()) {
+                    drawn.push(draw);
+                }
+            }
+            drawn
+        };
     // Keep the sample in factorial enumeration order, so that the greedy
     // loop's "ties by enumeration order" rule means the same thing here.
     draws.sort_unstable();
@@ -839,7 +846,12 @@ pub fn augment(args: AugmentArgs) -> Result<Outcome> {
     if let Some((kept, total)) = candidates.sampled {
         println!(
             "Candidates: {} sampled uniformly with seed {} from {} combinations (cap {})",
-            kept, seed, total, CANDIDATE_CAP
+            kept,
+            seed,
+            total
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| format!("more than {}", u128::MAX)),
+            CANDIDATE_CAP
         );
     } else {
         println!("Candidates: {} combinations", candidates.cells.len());
@@ -1690,7 +1702,7 @@ mod tests {
                 assert_eq!(picked.cells.len(), total as usize);
                 continue;
             }
-            assert_eq!(picked.sampled, Some((cap, total)), "cap {}", cap);
+            assert_eq!(picked.sampled, Some((cap, Some(total))), "cap {}", cap);
             assert_eq!(picked.cells.len(), cap, "cap {}", cap);
             let distinct: std::collections::HashSet<_> = picked
                 .cells
@@ -1699,6 +1711,37 @@ mod tests {
                 .collect();
             assert_eq!(distinct.len(), cap, "duplicates at cap {}", cap);
         }
+    }
+
+    #[test]
+    fn capped_sampling_handles_cardinality_beyond_u128() {
+        let factors: Vec<_> = (0..150)
+            .map(|i| Factor::parse(&format!("f{}", i), "d[1,2,3]").unwrap())
+            .collect();
+        let sample = |seed| {
+            let mut rng = Rng::new(seed);
+            let picked = candidate_cells(&factors, &[], &mut rng, 257);
+            assert_eq!(picked.sampled, Some((257, None)));
+            picked
+                .cells
+                .into_iter()
+                .map(|c| c.factor_levels)
+                .collect::<Vec<_>>()
+        };
+        let first = sample(42);
+        assert_eq!(first.len(), 257);
+        assert_eq!(
+            first.iter().collect::<std::collections::HashSet<_>>().len(),
+            257
+        );
+        assert!(
+            first
+                .iter()
+                .all(|row| row.len() == 150 && row.iter().all(|&v| v < 3))
+        );
+        assert!(first.windows(2).all(|rows| rows[0] < rows[1]));
+        assert_eq!(first, sample(42));
+        assert_ne!(first, sample(43));
     }
 
     /// Near the cap — 255 of 256 — the loop still returns the full sample, and
@@ -1998,7 +2041,7 @@ mod tests {
         ]);
         let mut rng = Rng::new(5);
         let picked = candidate_cells(&factors, &[], &mut rng, CANDIDATE_CAP);
-        assert_eq!(picked.sampled, Some((CANDIDATE_CAP, 1 << 18)));
+        assert_eq!(picked.sampled, Some((CANDIDATE_CAP, Some(1 << 18))));
         assert_eq!(picked.cells.len(), CANDIDATE_CAP);
         let distinct: std::collections::HashSet<_> = picked
             .cells
