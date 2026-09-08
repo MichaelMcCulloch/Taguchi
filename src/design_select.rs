@@ -147,8 +147,12 @@ pub fn build_cells(selected: &Selected, factors: &[Factor], roles: &[ReplicateRo
 /// A candidate base array. Catalog and Bush candidates carry a column pool
 /// that the assignment search draws from.
 enum Candidate {
-    /// `build_array`'s result (a) and the full factorial (d): one assignment.
+    /// `build_array`'s result: one assignment.
     Fixed(Selected),
+    /// Materialized only when this candidate survives the limits.
+    FullFactorial {
+        rows: usize,
+    },
     Catalog(CatalogRef),
     Bush {
         q: usize,
@@ -161,6 +165,7 @@ impl Candidate {
     fn rows(&self) -> usize {
         match self {
             Candidate::Fixed(s) => s.array.len(),
+            Candidate::FullFactorial { rows } => *rows,
             Candidate::Catalog(e) => e.n_runs,
             Candidate::Bush { q, k, .. } => q.pow(*k as u32),
         }
@@ -374,21 +379,25 @@ pub fn select(
     // arrays, (d) the full factorial. Nothing larger than the full factorial
     // can ever be preferable to it, so (b) and (c) stop there.
     let levels: Vec<usize> = factors.iter().map(Factor::level_count).collect();
-    let full = full_factorial(factors);
-    let full_rows = full.array.len();
+    // Keep the factorial symbolic until it survives the run budget and is
+    // actually visited. The factor space may exceed the machine word size.
+    let full_rows = levels.iter().try_fold(1usize, |n, &l| n.checked_mul(l));
+    let row_ceiling = full_rows.unwrap_or(usize::MAX);
     let mut candidates = vec![Candidate::Fixed(base)];
     candidates.extend(
         lookup::entries_supplying(&levels)
             .into_iter()
-            .filter(|e| e.n_runs <= full_rows)
+            .filter(|e| e.n_runs <= row_ceiling)
             .map(Candidate::Catalog),
     );
     candidates.extend(
         bush_candidates(factors)
             .into_iter()
-            .filter(|c| c.rows() <= full_rows),
+            .filter(|c| c.rows() <= row_ceiling),
     );
-    candidates.push(Candidate::Fixed(full));
+    if let Some(rows) = full_rows {
+        candidates.push(Candidate::FullFactorial { rows });
+    }
     // Stable: equal row counts keep the a, b, c, d enumeration order.
     candidates.sort_by_key(Candidate::rows);
 
@@ -403,13 +412,16 @@ pub fn select(
 
     let mut smallest: Option<(Selected, Vec<Cell>, Estimability)> = None;
     for candidate in &candidates {
-        let runs = candidate.rows() * replicates;
+        let Some(runs) = candidate.rows().checked_mul(replicates) else {
+            continue;
+        };
         let over_max = opts.max_runs.is_some_and(|max| runs > max);
         if smallest.is_some() && (over_max || runs < floor + opts.min_residual_df) {
             continue;
         }
         let pool = match candidate {
             Candidate::Fixed(s) => Pool::Fixed(s.clone()),
+            Candidate::FullFactorial { .. } => Pool::Fixed(full_factorial(factors)),
             Candidate::Catalog(e) => Pool::Catalog(e.clone()),
             Candidate::Bush { q, k, cols } => {
                 let mut array = bush::bush_at(&Gf::new(*q)?, *k);
@@ -611,6 +623,33 @@ mod tests {
         let fs = factors(specs);
         let model = Model::parse(formula, &fs)?;
         select(&fs, &[model], roles, None, opts)
+    }
+
+    #[test]
+    fn large_factor_space_does_not_materialize_the_factorial() {
+        // 3^50 overflows usize; its main effects still fit in a small OA.
+        let fs: Vec<Factor> = (0..50)
+            .map(|i| Factor::parse(&format!("f{i}"), "d[1-3]").unwrap())
+            .collect();
+        let formula = fs
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let model = Model::parse(&formula, &fs).unwrap();
+        let s = select(
+            &fs,
+            &[model],
+            &[],
+            None,
+            &SelectOpts {
+                max_runs: Some(243),
+                ..SelectOpts::default()
+            },
+        )
+        .unwrap();
+        assert!(s.cells.len() <= 243);
+        assert_eq!(s.estimability.rank, 101);
     }
 
     /// Outcome 3: the run counts the spec pins.
